@@ -2,17 +2,15 @@
  *
  * What this file does:
  *   - Owns the ps5_t/ps5_event_t/ps5_cmd_t state for the sketch.
- *   - Brings up Bluedroid + GAP + L2CAP HID transport (was ps5_spp.c + ps5_l2cap.c).
+ *   - Brings up Bluedroid + GAP + L2CAP HID transport via the helpers in
+ *     bluedroid/bluedroid.cpp.
  *   - Routes connect/disconnect and per-packet input events to the sketch's
  *     attach*() callbacks.
+ *   - Handles auto-pair (scan + first-match connect) and auto-reconnect.
  *
  * What it does NOT do:
- *   - Build or parse any DualSense bytes. That all lives in ps5_bytes.cpp.
- *
- * Bluedroid internal symbols (L2CA_*, BTM_*, osi_*, BT_HDR, BD_ADDR, ...) are
- * declared by the headers vendored under src/bluedroid/. Implementations live
- * inside the precompiled Bluedroid blob shipped with Arduino-ESP32. See
- * src/bluedroid/README.md for how/when to refresh those headers.
+ *   - Bluedroid plumbing (L2CAP / GAP / SPP). See bluedroid/bluedroid.cpp.
+ *   - Build or parse any DualSense bytes. See ps5_bytes.cpp.
  */
 
 #include "ps5Controller.h"
@@ -22,186 +20,9 @@
 #include <esp_bt_device.h>
 #include <esp_bt_main.h>
 #include <esp_gap_bt_api.h>
-#include <esp_spp_api.h>
 #include <esp_log.h>
 
-#include "bluedroid/bluedroid.h"
-
 #define ps5_TAG "ps5"
-
-/* ============================================================================
- * MARK: TRANSPORT - L2CAP HID (was ps5_l2cap.c)
- *
- *   - Registers HID control (PSM 0x11) + interrupt (PSM 0x13) listeners.
- *   - Handles the L2CAP config handshake (controller -> us is fully connected
- *     after we get the *second* config-confirm, which is on the interrupt CID).
- *   - Sends fully-formed HID frames built by ps5_bytes.cpp.
- * The functions exposed back to ps5_bytes.cpp / the class are declared with
- * C linkage in ps5Controller.h's extern "C" block.
- * ==========================================================================*/
-
-extern "C" {
-
-/* L2CAP application-info struct - one set of callbacks shared by both PSMs. */
-static void ps5_l2cap_connect_ind_cback (BD_ADDR bd_addr, uint16_t cid, uint16_t psm, uint8_t id);
-static void ps5_l2cap_connect_cfm_cback (uint16_t cid, uint16_t result);
-static void ps5_l2cap_config_ind_cback  (uint16_t cid, tL2CAP_CFG_INFO* p_cfg);
-static void ps5_l2cap_config_cfm_cback  (uint16_t cid, tL2CAP_CFG_INFO* p_cfg);
-static void ps5_l2cap_disconnect_ind_cback(uint16_t cid, bool ack_needed);
-static void ps5_l2cap_disconnect_cfm_cback(uint16_t cid, uint16_t result);
-static void ps5_l2cap_data_ind_cback    (uint16_t cid, BT_HDR* p_msg);
-static void ps5_l2cap_congest_cback     (uint16_t cid, bool congested);
-
-static const tL2CAP_APPL_INFO dyn_info = {
-    ps5_l2cap_connect_ind_cback,
-    ps5_l2cap_connect_cfm_cback,
-    NULL,
-    ps5_l2cap_config_ind_cback,
-    ps5_l2cap_config_cfm_cback,
-    ps5_l2cap_disconnect_ind_cback,
-    ps5_l2cap_disconnect_cfm_cback,
-    NULL,
-    ps5_l2cap_data_ind_cback,
-    ps5_l2cap_congest_cback,
-    NULL
-};
-
-static tL2CAP_CFG_INFO ps5_cfg_info;
-static bool       is_connected            = false;
-static BD_ADDR    g_bd_addr               = {0};
-static uint16_t   l2cap_control_channel   = 0;
-static uint16_t   l2cap_interrupt_channel = 0;
-
-// MARK: l2cap_init_service - register one PSM with L2CAP + Security Manager.
-static void ps5_l2cap_init_service(const char* name, uint16_t psm, uint8_t security_id) {
-    if (!L2CA_Register(psm, (tL2CAP_APPL_INFO*)&dyn_info)) {
-        ESP_LOGE(ps5_TAG, "L2CA_Register %s failed", name); return;
-    }
-    if (!BTM_SetSecurityLevel(false, name, security_id, 0, psm, 0, 0)) {
-        ESP_LOGE(ps5_TAG, "BTM_SetSecurityLevel %s failed", name); return;
-    }
-    ESP_LOGI(ps5_TAG, "Service %s up", name);
-}
-
-// MARK: l2cap_init_services - bring up HID control + interrupt PSMs.
-void ps5_l2cap_init_services(void) {
-    ps5_l2cap_init_service("ps5-HIDC", BT_PSM_HIDC, BTM_SEC_SERVICE_FIRST_EMPTY);
-    ps5_l2cap_init_service("ps5-HIDI", BT_PSM_HIDI, BTM_SEC_SERVICE_FIRST_EMPTY + 1);
-}
-
-void ps5_l2cap_deinit_services(void) {
-    L2CA_Deregister(BT_PSM_HIDC);
-    L2CA_Deregister(BT_PSM_HIDI);
-}
-
-// MARK: l2cap_reconnect - retry the outbound HID-control L2CAP connect.
-long ps5_l2cap_reconnect(void) {
-    long ret = L2CA_CONNECT_REQ(BT_PSM_HIDC, g_bd_addr, NULL, NULL);
-    ESP_LOGE(ps5_TAG, "L2CA_CONNECT_REQ ret=%ld", ret);
-    if (ret == 0) return -1;
-    l2cap_control_channel = (uint16_t)ret;
-    return ret;
-}
-
-// MARK: l2cap_connect - remember target MAC and fire the first outbound CONNECT_REQ.
-long ps5_l2cap_connect(BD_ADDR addr) {
-    memmove(g_bd_addr, addr, sizeof(BD_ADDR));
-    return ps5_l2cap_reconnect();
-}
-
-// MARK: l2cap_send - copy bytes into a Bluedroid BT_HDR and write on the given CID.
-static void ps5_l2cap_send_on(uint16_t cid, hid_cmd_t* hid_cmd, uint8_t len) {
-    if (cid == 0) { ESP_LOGE(ps5_TAG, "send: cid=0"); return; }
-    BT_HDR* p_buf = (BT_HDR*)osi_malloc(BT_DEFAULT_BUFFER_SIZE);
-    if (!p_buf) { ESP_LOGE(ps5_TAG, "send: osi_malloc failed"); return; }
-    p_buf->length = len;
-    p_buf->offset = L2CAP_MIN_OFFSET;
-    memcpy((uint8_t*)(p_buf + 1) + p_buf->offset, hid_cmd->data, len);
-    uint8_t r = L2CA_DataWrite(cid, p_buf);
-    if      (r == L2CAP_DW_SUCCESS)   ESP_LOGD(ps5_TAG, "tx cid=0x%02x ok (%uB)", cid, len);
-    else if (r == L2CAP_DW_CONGESTED) ESP_LOGW(ps5_TAG, "tx cid=0x%02x congested",  cid);
-    else                              ESP_LOGE(ps5_TAG, "tx cid=0x%02x failed (%u)", cid, r);
-}
-void ps5_l2cap_send_hid          (hid_cmd_t* c, uint8_t len) { ps5_l2cap_send_on(l2cap_control_channel,   c, len); }
-void ps5_l2cap_send_hid_interrupt(hid_cmd_t* c, uint8_t len) { ps5_l2cap_send_on(l2cap_interrupt_channel, c, len); }
-
-/* ---- L2CAP callbacks ---- */
-
-// MARK: connect_ind - inbound L2CAP connect from the controller; ack + start config.
-static void ps5_l2cap_connect_ind_cback(BD_ADDR bd_addr, uint16_t cid, uint16_t psm, uint8_t id) {
-    L2CA_CONNECT_RSP(bd_addr, id, cid, L2CAP_CONN_PENDING, L2CAP_CONN_PENDING, NULL, NULL);
-    L2CA_CONNECT_RSP(bd_addr, id, cid, L2CAP_CONN_OK,      L2CAP_CONN_OK,      NULL, NULL);
-    L2CA_CONFIG_REQ(cid, &ps5_cfg_info);
-    if      (psm == BT_PSM_HIDC) l2cap_control_channel   = cid;
-    else if (psm == BT_PSM_HIDI) l2cap_interrupt_channel = cid;
-}
-
-static void ps5_l2cap_connect_cfm_cback(uint16_t cid, uint16_t result) {
-    ESP_LOGI(ps5_TAG, "connect_cfm cid=0x%02x result=%u", cid, result);
-}
-
-// MARK: config_ind - accept the controller's config request as-is.
-static void ps5_l2cap_config_ind_cback(uint16_t cid, tL2CAP_CFG_INFO* p_cfg) {
-    p_cfg->result = L2CAP_CFG_OK;
-    L2CA_ConfigRsp(cid, p_cfg);
-}
-
-// MARK: config_cfm - second config-confirm = controller fully connected.
-static void ps5_l2cap_config_cfm_cback(uint16_t cid, tL2CAP_CFG_INFO* p_cfg) {
-    (void)p_cfg;
-    bool prev = is_connected;
-    is_connected = (cid == l2cap_interrupt_channel);
-    if (prev != is_connected) ps5ConnectEvent(is_connected ? 1 : 0);
-}
-
-static void ps5_l2cap_disconnect_ind_cback(uint16_t cid, bool ack_needed) {
-    is_connected = false;
-    if (ack_needed) L2CA_DisconnectRsp(cid);
-    ps5ConnectEvent(0);
-}
-
-static void ps5_l2cap_disconnect_cfm_cback(uint16_t cid, uint16_t result) {
-    ESP_LOGI(ps5_TAG, "disconnect_cfm cid=0x%02x result=%u", cid, result);
-}
-
-// MARK: data_ind - inbound HID input report; hand to parsePacket().
-static void ps5_l2cap_data_ind_cback(uint16_t cid, BT_HDR* p_buf) {
-    (void)cid;
-    if (p_buf->length > 2) {
-        /* Real L2CAP payload starts at p_buf->offset; first byte is the
-         * HIDP transaction header (0xA1 = DATA|INPUT) which parsePacket()
-         * will skip itself. */
-        parsePacket(p_buf->data + p_buf->offset);
-    }
-    osi_free(p_buf);
-}
-
-static void ps5_l2cap_congest_cback(uint16_t cid, bool congested) {
-    ESP_LOGI(ps5_TAG, "congest cid=0x%02x %d", cid, congested);
-}
-
-/* ============================================================================
- * MARK: GAP/SPP - device-name + connectable scan-mode bring-up (was ps5_spp.c)
- * ==========================================================================*/
-
-static void sppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
-    (void)param;
-    if (event == ESP_SPP_INIT_EVT) {
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-    }
-}
-
-void sppInit(void) {
-    esp_err_t ret;
-    if ((ret = esp_spp_register_callback(sppCallback)) != ESP_OK) {
-        ESP_LOGE(ps5_TAG, "spp register failed: %s", esp_err_to_name(ret)); return;
-    }
-    if ((ret = esp_spp_init(ESP_SPP_MODE_CB)) != ESP_OK) {
-        ESP_LOGE(ps5_TAG, "spp init failed: %s", esp_err_to_name(ret)); return;
-    }
-}
-
-} /* extern "C" */
 
 /* ============================================================================
  * MARK: ARDUINO CLASS
@@ -249,7 +70,13 @@ extern "C" void ps5ConnectEvent(uint8_t isConnected) {
 ps5Controller::ps5Controller() {}
 
 // MARK: begin() - bring up BT Classic + Bluedroid + register HID L2CAP listeners.
-bool ps5Controller::begin() {
+//   No args:  scan up to 30 s, connect to the FIRST DualSense detected (early-exit).
+//   uint8_t:  same, custom timeout.
+//   const char*: connect to that specific MAC.
+// Either way, auto-reconnect runs every 5 s while disconnected (see isConnected()).
+bool ps5Controller::begin() { return begin((uint8_t)30); }
+
+bool ps5Controller::begin(uint8_t timeoutSecs) {
   g_active = this;
 
   if (!btStarted() && !btStart())                                         { log_e("btStart failed");           return false; }
@@ -260,6 +87,17 @@ bool ps5Controller::begin() {
 
   sppInit();
   ps5_l2cap_init_services();
+
+  /* MARK: auto-pair - if no MAC stored, scan & connect to first DualSense seen. */
+  if (!ps5_l2cap_has_target()) {
+    log_i("ps5.begin(): scanning up to %us for a DualSense...", timeoutSecs);
+    if (!autoPair(timeoutSecs)) {
+      log_e("ps5.begin(): no DualSense found within %us. Will keep retrying via isConnected().", timeoutSecs);
+    }
+  } else {
+    /* Re-kick reconnect on every begin() in case the radio was previously down. */
+    ps5_l2cap_reconnect();
+  }
   return true;
 }
 
@@ -271,7 +109,7 @@ bool ps5Controller::begin(const char* mac) {
     return false;
   }
   ps5_l2cap_connect(addr);
-  return begin();
+  return begin((uint8_t)30);
 }
 
 // MARK: end() - placeholder (no clean teardown yet).
@@ -343,6 +181,54 @@ bool ps5Controller::isConnected() {
   return false;
 }
 
+/* ============================================================ auto-pair */
+
+// MARK: autoPair - scan up to `timeoutSecs` and connect to the FIRST DualSense
+// or Wireless Controller detected. Bails out as soon as one is seen; doesn't
+// wait the full timeout. Used internally by begin().
+namespace {
+  esp_bd_addr_t gApMac    = {0};
+  bool          gApFound  = false;
+
+  void onAutoPair(const uint8_t mac[6], const char* name, int8_t rssi) {
+    if (gApFound) return;
+    if (!name || !*name) return;
+    if (!strstr(name, "DualSense") && !strstr(name, "Wireless Controller")) return;
+    memcpy(gApMac, mac, 6);
+    gApFound = true;
+    log_i("auto-pair: %02x:%02x:%02x:%02x:%02x:%02x rssi=%d (%s)",
+          mac[0],mac[1],mac[2],mac[3],mac[4],mac[5], rssi, name);
+  }
+}
+
+bool ps5Controller::autoPair(uint8_t timeoutSecs) {
+  if (timeoutSecs < 2) timeoutSecs = 2;
+  gApFound = false;
+
+  if (!btStarted() && !btStart())                                       return false;
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED &&
+      esp_bluedroid_init() != ESP_OK)                                   return false;
+  if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED &&
+      esp_bluedroid_enable() != ESP_OK)                                 return false;
+
+  gScanCb = onAutoPair;
+  esp_bt_gap_register_callback(onDiscovery);
+
+  uint8_t units = (uint8_t)((timeoutSecs * 100 + 127) / 128);  /* 1.28-s units */
+  if (units < 1) units = 1;
+  esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, units, 0);
+
+  /* Early-exit: stop polling the moment a DualSense shows up. */
+  uint32_t deadline = millis() + (uint32_t)timeoutSecs * 1000UL;
+  while (!gApFound && millis() < deadline) vTaskDelay(pdMS_TO_TICKS(100));
+  esp_bt_gap_cancel_discovery();
+  gScanCb = nullptr;
+
+  if (!gApFound) return false;
+  ps5_l2cap_connect(gApMac);
+  return true;
+}
+
 /* ============================================================ output helpers */
 
 // MARK: setLed - mutate local lightbar state. Sent on next sendToController().
@@ -380,6 +266,32 @@ void ps5Controller::_event_callback(void* obj, ps5_t d, ps5_event_t e) {
   ps5Controller* self = (ps5Controller*)obj;
   self->data  = d;
   self->event = e;
+
+  /* MARK: flat-api refresh - keep ps5.lx / ps5.cross / ps5.gyroX in sync. */
+  self->lx = d.analog.stick.lx;   self->ly = d.analog.stick.ly;
+  self->rx = d.analog.stick.rx;   self->ry = d.analog.stick.ry;
+  self->l2 = d.analog.button.l2;  self->r2 = d.analog.button.r2;
+
+  self->up    = d.button.up;      self->down  = d.button.down;
+  self->left  = d.button.left;    self->right = d.button.right;
+  self->cross = d.button.cross;   self->circle   = d.button.circle;
+  self->square= d.button.square;  self->triangle = d.button.triangle;
+  self->l1 = d.button.l1;  self->r1 = d.button.r1;
+  self->l3 = d.button.l3;  self->r3 = d.button.r3;
+  self->share = d.button.share;  self->options = d.button.options;
+  self->ps_btn = d.button.ps;    self->touchpad = d.button.touchpad;
+  self->mute   = d.button.mute;
+
+  self->gyroX = d.sensor.gyro.x;   self->gyroY = d.sensor.gyro.y;   self->gyroZ = d.sensor.gyro.z;
+  self->accelX= d.sensor.accel.x;  self->accelY= d.sensor.accel.y;  self->accelZ= d.sensor.accel.z;
+  self->sensorTime = d.sensor.timestamp;
+
+  self->battery      = d.status.battery;
+  self->charging     = d.status.charging;
+  self->fullyCharged = d.status.fully_charged;
+  self->headphones   = d.status.headphones;
+  self->micJack      = d.status.mic;
+
   if (self->_callback_event) self->_callback_event();
 }
 

@@ -19,20 +19,6 @@ static const uint32_t kPlayerMs = 600;
 static const uint32_t kReportMs = 1000;
 static const int      kStickDeadzone = 16;   // LSB; ~12 % of full scale
 
-// MARK: pickedMac - first DualSense / Wireless Controller seen during scan.
-static char gPickedMac[18] = {0};
-
-static void onScan(const uint8_t mac[6], const char* name, int8_t rssi) {
-  Serial.printf("  %02x:%02x:%02x:%02x:%02x:%02x  rssi=%4d  %s\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                rssi, (name && name[0]) ? name : "(unknown)");
-  if (gPickedMac[0]) return;
-  if (!name) return;
-  if (!strstr(name, "DualSense") && !strstr(name, "Wireless Controller")) return;
-  snprintf(gPickedMac, sizeof(gPickedMac), "%02x:%02x:%02x:%02x:%02x:%02x",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
 // MARK: hsvToRgb - 6-sector HSV->RGB. h in [0..360), s,v in [0..1].
 static void hsvToRgb(float h, float s, float v,
                      uint8_t& r, uint8_t& g, uint8_t& b) {
@@ -87,23 +73,20 @@ static void stickToRumble(int8_t rx, int8_t ry, uint8_t& small_, uint8_t& large_
 static void snapshot(uint8_t r, uint8_t g, uint8_t b,
                      uint8_t small_, uint8_t large_, uint8_t playerBit) {
   Serial.println(F("------------------------------------------------"));
-  Serial.printf("LS:    x=%+4d y=%+4d  click=%d\n",
-                ps5.LStickX(), ps5.LStickY(), ps5.L3());
-  Serial.printf("RS:    x=%+4d y=%+4d  click=%d\n",
-                ps5.RStickX(), ps5.RStickY(), ps5.R3());
-  Serial.printf("TRIG:  L1=%d L2=%d (val=%3u)   R1=%d R2=%d (val=%3u)\n",
-                ps5.L1(), ps5.L2(), ps5.L2Value(),
-                ps5.R1(), ps5.R2(), ps5.R2Value());
+  Serial.printf("LS:    x=%+4d y=%+4d  click=%d\n", ps5.lx, ps5.ly, ps5.l3);
+  Serial.printf("RS:    x=%+4d y=%+4d  click=%d\n", ps5.rx, ps5.ry, ps5.r3);
+  Serial.printf("TRIG:  L1=%d L2val=%3u   R1=%d R2val=%3u\n",
+                ps5.l1, ps5.l2, ps5.r1, ps5.r2);
   Serial.printf("DPAD:  U=%d D=%d L=%d R=%d\n",
-                ps5.Up(), ps5.Down(), ps5.Left(), ps5.Right());
+                ps5.up, ps5.down, ps5.left, ps5.right);
   Serial.printf("FACE:  Tri=%d Cir=%d Cro=%d Sq=%d\n",
-                ps5.Triangle(), ps5.Circle(), ps5.Cross(), ps5.Square());
+                ps5.triangle, ps5.circle, ps5.cross, ps5.square);
   Serial.printf("META:  Share=%d Opt=%d PS=%d Touch=%d Mute=%d\n",
-                ps5.Share(), ps5.Options(), ps5.PSButton(), ps5.Touchpad(), ps5.Mute());
+                ps5.share, ps5.options, ps5.ps_btn, ps5.touchpad, ps5.mute);
   Serial.printf("GYRO:  x=%+6d y=%+6d z=%+6d\n",
-                ps5.GyroX(), ps5.GyroY(), ps5.GyroZ());
+                ps5.gyroX, ps5.gyroY, ps5.gyroZ);
   Serial.printf("ACCEL: x=%+6d y=%+6d z=%+6d\n",
-                ps5.AccelX(), ps5.AccelY(), ps5.AccelZ());
+                ps5.accelX, ps5.accelY, ps5.accelZ);
   for (int i = 0; i < 2; i++) {
     if (ps5.TouchActive(i))
       Serial.printf("TOUCH%d: x=%4u y=%4u id=%u\n",
@@ -112,24 +95,18 @@ static void snapshot(uint8_t r, uint8_t g, uint8_t b,
       Serial.printf("TOUCH%d: idle\n", i);
   }
   Serial.printf("BAT:   %u0%% %s  HP=%d MIC=%d\n",
-                ps5.Battery(), ps5.Charging() ? "CHG" : "DSCH",
-                ps5.Headphones(), ps5.MicJack());
+                ps5.battery, ps5.charging ? "CHG" : "DSCH",
+                ps5.headphones, ps5.micJack);
   Serial.printf("OUT:   rgb=(%3u,%3u,%3u)  rumble=(%3u,%3u)  player=bit%u  muteLED=%d\n",
-                r, g, b, small_, large_, playerBit, ps5.Mute() ? 1 : 0);
+                r, g, b, small_, large_, playerBit, ps5.mute ? 1 : 0);
 }
 
 void setup() {
   Serial.begin(115200);
   vTaskDelay(pdMS_TO_TICKS(500));
   Serial.println(F("\n[BOOT] esp-ps5 testEverything"));
-  Serial.println(F("[BOOT] Scanning Bluetooth Classic for 5 s..."));
-  ps5.scanDevices(5, onScan);
-  if (!gPickedMac[0]) {
-    Serial.println(F("[BOOT] No DualSense found. Hold PS+Create and reset."));
-    return;
-  }
-  Serial.printf("[BOOT] Connecting to %s\n", gPickedMac);
-  ps5.begin(gPickedMac);
+  Serial.println(F("[BOOT] ps5.begin(20): scanning up to 20s, connects on first DualSense seen."));
+  ps5.begin(20);   // auto-scan + pair (early-exit) + auto-reconnect
 }
 
 void loop() {
@@ -150,13 +127,14 @@ void loop() {
 
   if (now - tSend >= kSendMs) {
     tSend = now;
-    stickToLightbar(ps5.LStickX(), ps5.LStickY(), rOut, gOut, bOut);
-    stickToRumble  (ps5.RStickX(), ps5.RStickY(), smallR, largeR);
-    ps5.setLed(rOut, gOut, bOut);
-    ps5.setRumble(smallR, largeR);
-    ps5.setPlayerLeds(1u << playerBit);
-    ps5.setMuteLed(ps5.Mute() ? 1 : 0);
-    ps5.sendToController();
+    stickToLightbar(ps5.lx, ps5.ly, rOut, gOut, bOut);
+    stickToRumble  (ps5.rx, ps5.ry, smallR, largeR);
+    // MARK: chained output - all four set* in one fluent call.
+    ps5.led(rOut, gOut, bOut)
+       .rumble(smallR, largeR)
+       .playerLeds(1u << playerBit)
+       .muteLed(ps5.mute ? 1 : 0)
+       .send();
   }
 
   if (now - tReport >= kReportMs) {

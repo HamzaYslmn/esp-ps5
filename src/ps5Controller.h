@@ -140,14 +140,55 @@ class ps5Controller {
   ps5_event_t event;
   ps5_cmd_t   output;
 
+  /* ============================================================ FLAT API
+   * Refreshed automatically on every input packet. Just read them as
+   * plain variables — no parentheses, no nested structs.
+   *
+   *   if (ps5.cross) { ... }
+   *   int speed = ps5.ly;
+   *   float gx  = ps5.gyroX / 1024.0f;     // deg/s
+   *
+   * Conventions:
+   *   sticks  lx ly rx ry      int8   -128..+127, centered at 0  (Y is inverted: up = negative)
+   *   trigger l2 r2            uint8  0..255  (0 = released, also doubles as "pressed if > 0")
+   *   buttons                  bool
+   *   gyro*                    int16  raw, ÷ 1024 = deg/s
+   *   accel*                   int16  raw, ÷ 8192 = g  (includes gravity!)
+   *   battery                  uint8  0..10  (10% steps)
+   */
+  int8_t   lx = 0, ly = 0, rx = 0, ry = 0;
+  uint8_t  l2 = 0, r2 = 0;                           // analog trigger 0..255
+  bool     l1 = false, r1 = false, l3 = false, r3 = false;
+  bool     up = false, down = false, left = false, right = false;
+  bool     cross = false, circle = false, square = false, triangle = false;
+  bool     share = false, options = false, ps_btn = false, touchpad = false, mute = false;
+  int16_t  gyroX = 0, gyroY = 0, gyroZ = 0;
+  int16_t  accelX = 0, accelY = 0, accelZ = 0;
+  uint32_t sensorTime = 0;
+  uint8_t  battery = 0;
+  bool     charging = false, fullyCharged = false, headphones = false, micJack = false;
+
+  /* Output shortcuts: set the field then call send(). */
+  ps5Controller& send() { sendToController(); return *this; }
+
   ps5Controller();
 
+  /* MARK: begin - bring up Bluetooth, then connect.
+   *   begin()                  -> auto-scan, connect to the FIRST DualSense seen, max 30 s.
+   *   begin(timeoutSecs)       -> same, custom timeout (e.g. ps5.begin(20)).
+   *   begin("AA:BB:..") -> connect to that specific MAC.
+   * Auto-reconnect runs every 5 s while disconnected (see isConnected()). */
   bool begin();
+  bool begin(uint8_t timeoutSecs);
   bool begin(const char* mac);
 
   /* MARK: scanDevices - one-shot BT Classic inquiry. cb fires per discovered
    * device with (mac, name, rssi). Caller picks one and feeds it to begin(). */
   bool scanDevices(uint8_t secs, scan_cb_t cb);
+
+  /* MARK: autoPair - scan up to `timeoutSecs` and connect to the first DualSense
+   * detected (early-exit, doesn't wait the full timeout). Called by begin(). */
+  bool autoPair(uint8_t timeoutSecs);
 
   void end();
   bool isConnected();
@@ -158,6 +199,14 @@ class ps5Controller {
   void setPlayerLeds(uint8_t bitmask);   /* 5 bits, bit0..bit4 */
   void setMuteLed(uint8_t mode);         /* 0=off, 1=on, 2=pulse */
   void sendToController();
+
+  /* MARK: fluent api - chainable shorthand setters. Each returns *this so you
+   * can chain:  ps5.led(255,0,0).rumble(255,0).send();
+   * Identical effect to the set* methods above. */
+  ps5Controller& led(uint8_t r, uint8_t g, uint8_t b)         { setLed(r,g,b);            return *this; }
+  ps5Controller& rumble(uint8_t small, uint8_t large)         { setRumble(small,large);   return *this; }
+  ps5Controller& playerLeds(uint8_t bitmask)                  { setPlayerLeds(bitmask);   return *this; }
+  ps5Controller& muteLed(uint8_t mode)                        { setMuteLed(mode);         return *this; }
 
   /* Sketch hooks. */
   void attach(callback_t cb);
@@ -266,12 +315,13 @@ uint32_t ps5_crc32(uint32_t seed, const uint8_t* buf, uint16_t len);
 void ps5ConnectEvent(uint8_t isConnected);
 void ps5PacketEvent(ps5_t ps5, ps5_event_t event);
 
-/* Implemented in ps5_spp.c / ps5_l2cap.c */
+/* Implemented in bluedroid/bluedroid.cpp */
 void  sppInit(void);
 void  ps5_l2cap_init_services(void);
 void  ps5_l2cap_deinit_services(void);
 long  ps5_l2cap_connect(uint8_t addr[6]);
 long  ps5_l2cap_reconnect(void);
+bool  ps5_l2cap_has_target(void);
 void  ps5_l2cap_send_hid          (hid_cmd_t* cmd, uint8_t len); /* control PSM 0x11   */
 void  ps5_l2cap_send_hid_interrupt(hid_cmd_t* cmd, uint8_t len); /* interrupt PSM 0x13 */
 

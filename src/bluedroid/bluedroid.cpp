@@ -1,0 +1,214 @@
+/* bluedroid.cpp - Bluedroid transport glue (L2CAP HID + GAP/SPP bring-up).
+ *
+ * This file is intentionally NOT about the DualSense protocol. Everything
+ * here is generic Bluedroid plumbing: opening L2CAP listeners on the two
+ * HID PSMs (control 0x11 + interrupt 0x13), shuttling bytes through, and
+ * setting connectable scan mode. The PS5-specific code (parser, builder,
+ * Arduino class) lives in ../ps5Controller.cpp and ../ps5_bytes.cpp.
+ *
+ * Why this is split out:
+ *   - It uses Bluedroid-internal symbols (L2CA_*, BTM_*, osi_*, BT_HDR,
+ *     BD_ADDR, ...). Those are declared by the hand-curated headers in
+ *     this folder and resolved at link time against the precompiled
+ *     Bluedroid blob shipped with Arduino-ESP32.
+ *   - Keeping it isolated means a future port to NimBLE / a different
+ *     stack only has to rewrite ONE file.
+ *
+ * The two functional groups in this file:
+ *   1. L2CAP transport - register HIDC/HIDI PSMs, run the connect/config
+ *      handshake, send/receive HID frames.
+ *   2. GAP/SPP bring-up - device-name + connectable scan mode.
+ *
+ * The handful of C-linkage entry points used by ps5Controller.cpp are
+ * declared in ../ps5Controller.h's extern "C" block.
+ */
+
+#include "../ps5Controller.h"
+#include "bluedroid.h"
+
+#include <esp_bt.h>
+#include <esp_bt_defs.h>
+#include <esp_bt_main.h>
+#include <esp_gap_bt_api.h>
+#include <esp_spp_api.h>
+#include <esp_log.h>
+
+#define ps5_TAG "ps5"
+
+extern "C" {
+
+/* ============================================================================
+ * MARK: TRANSPORT - L2CAP HID
+ *
+ *   - Registers HID control (PSM 0x11) + interrupt (PSM 0x13) listeners.
+ *   - Runs the L2CAP config handshake (controller -> us is fully connected
+ *     after we get the *second* config-confirm, on the interrupt CID).
+ *   - Sends fully-formed HID frames built by ps5_bytes.cpp.
+ * ==========================================================================*/
+
+/* L2CAP application-info struct - one set of callbacks shared by both PSMs. */
+static void ps5_l2cap_connect_ind_cback (BD_ADDR bd_addr, uint16_t cid, uint16_t psm, uint8_t id);
+static void ps5_l2cap_connect_cfm_cback (uint16_t cid, uint16_t result);
+static void ps5_l2cap_config_ind_cback  (uint16_t cid, tL2CAP_CFG_INFO* p_cfg);
+static void ps5_l2cap_config_cfm_cback  (uint16_t cid, tL2CAP_CFG_INFO* p_cfg);
+static void ps5_l2cap_disconnect_ind_cback(uint16_t cid, bool ack_needed);
+static void ps5_l2cap_disconnect_cfm_cback(uint16_t cid, uint16_t result);
+static void ps5_l2cap_data_ind_cback    (uint16_t cid, BT_HDR* p_msg);
+static void ps5_l2cap_congest_cback     (uint16_t cid, bool congested);
+
+static const tL2CAP_APPL_INFO dyn_info = {
+    ps5_l2cap_connect_ind_cback,
+    ps5_l2cap_connect_cfm_cback,
+    NULL,
+    ps5_l2cap_config_ind_cback,
+    ps5_l2cap_config_cfm_cback,
+    ps5_l2cap_disconnect_ind_cback,
+    ps5_l2cap_disconnect_cfm_cback,
+    NULL,
+    ps5_l2cap_data_ind_cback,
+    ps5_l2cap_congest_cback,
+    NULL
+};
+
+static tL2CAP_CFG_INFO ps5_cfg_info;
+static bool       is_connected            = false;
+static BD_ADDR    g_bd_addr               = {0};
+static uint16_t   l2cap_control_channel   = 0;
+static uint16_t   l2cap_interrupt_channel = 0;
+
+// MARK: l2cap_has_target - true once a MAC has been latched (via connect()).
+bool ps5_l2cap_has_target(void) {
+    for (int i = 0; i < 6; i++) if (g_bd_addr[i]) return true;
+    return false;
+}
+
+// MARK: l2cap_init_service - register one PSM with L2CAP + Security Manager.
+static void ps5_l2cap_init_service(const char* name, uint16_t psm, uint8_t security_id) {
+    if (!L2CA_Register(psm, (tL2CAP_APPL_INFO*)&dyn_info)) {
+        ESP_LOGE(ps5_TAG, "L2CA_Register %s failed", name); return;
+    }
+    if (!BTM_SetSecurityLevel(false, name, security_id, 0, psm, 0, 0)) {
+        ESP_LOGE(ps5_TAG, "BTM_SetSecurityLevel %s failed", name); return;
+    }
+    ESP_LOGI(ps5_TAG, "Service %s up", name);
+}
+
+// MARK: l2cap_init_services - bring up HID control + interrupt PSMs.
+void ps5_l2cap_init_services(void) {
+    ps5_l2cap_init_service("ps5-HIDC", BT_PSM_HIDC, BTM_SEC_SERVICE_FIRST_EMPTY);
+    ps5_l2cap_init_service("ps5-HIDI", BT_PSM_HIDI, BTM_SEC_SERVICE_FIRST_EMPTY + 1);
+}
+
+void ps5_l2cap_deinit_services(void) {
+    L2CA_Deregister(BT_PSM_HIDC);
+    L2CA_Deregister(BT_PSM_HIDI);
+}
+
+// MARK: l2cap_reconnect - retry the outbound HID-control L2CAP connect.
+long ps5_l2cap_reconnect(void) {
+    long ret = L2CA_CONNECT_REQ(BT_PSM_HIDC, g_bd_addr, NULL, NULL);
+    ESP_LOGE(ps5_TAG, "L2CA_CONNECT_REQ ret=%ld", ret);
+    if (ret == 0) return -1;
+    l2cap_control_channel = (uint16_t)ret;
+    return ret;
+}
+
+// MARK: l2cap_connect - remember target MAC and fire the first outbound CONNECT_REQ.
+long ps5_l2cap_connect(BD_ADDR addr) {
+    memmove(g_bd_addr, addr, sizeof(BD_ADDR));
+    return ps5_l2cap_reconnect();
+}
+
+// MARK: l2cap_send - copy bytes into a Bluedroid BT_HDR and write on the given CID.
+static void ps5_l2cap_send_on(uint16_t cid, hid_cmd_t* hid_cmd, uint8_t len) {
+    if (cid == 0) { ESP_LOGE(ps5_TAG, "send: cid=0"); return; }
+    BT_HDR* p_buf = (BT_HDR*)osi_malloc(BT_DEFAULT_BUFFER_SIZE);
+    if (!p_buf) { ESP_LOGE(ps5_TAG, "send: osi_malloc failed"); return; }
+    p_buf->length = len;
+    p_buf->offset = L2CAP_MIN_OFFSET;
+    memcpy((uint8_t*)(p_buf + 1) + p_buf->offset, hid_cmd->data, len);
+    uint8_t r = L2CA_DataWrite(cid, p_buf);
+    if      (r == L2CAP_DW_SUCCESS)   ESP_LOGD(ps5_TAG, "tx cid=0x%02x ok (%uB)", cid, len);
+    else if (r == L2CAP_DW_CONGESTED) ESP_LOGW(ps5_TAG, "tx cid=0x%02x congested",  cid);
+    else                              ESP_LOGE(ps5_TAG, "tx cid=0x%02x failed (%u)", cid, r);
+}
+void ps5_l2cap_send_hid          (hid_cmd_t* c, uint8_t len) { ps5_l2cap_send_on(l2cap_control_channel,   c, len); }
+void ps5_l2cap_send_hid_interrupt(hid_cmd_t* c, uint8_t len) { ps5_l2cap_send_on(l2cap_interrupt_channel, c, len); }
+
+/* ---- L2CAP callbacks ---- */
+
+// MARK: connect_ind - inbound L2CAP connect from the controller; ack + start config.
+static void ps5_l2cap_connect_ind_cback(BD_ADDR bd_addr, uint16_t cid, uint16_t psm, uint8_t id) {
+    L2CA_CONNECT_RSP(bd_addr, id, cid, L2CAP_CONN_PENDING, L2CAP_CONN_PENDING, NULL, NULL);
+    L2CA_CONNECT_RSP(bd_addr, id, cid, L2CAP_CONN_OK,      L2CAP_CONN_OK,      NULL, NULL);
+    L2CA_CONFIG_REQ(cid, &ps5_cfg_info);
+    if      (psm == BT_PSM_HIDC) l2cap_control_channel   = cid;
+    else if (psm == BT_PSM_HIDI) l2cap_interrupt_channel = cid;
+}
+
+static void ps5_l2cap_connect_cfm_cback(uint16_t cid, uint16_t result) {
+    ESP_LOGI(ps5_TAG, "connect_cfm cid=0x%02x result=%u", cid, result);
+}
+
+// MARK: config_ind - accept the controller's config request as-is.
+static void ps5_l2cap_config_ind_cback(uint16_t cid, tL2CAP_CFG_INFO* p_cfg) {
+    p_cfg->result = L2CAP_CFG_OK;
+    L2CA_ConfigRsp(cid, p_cfg);
+}
+
+// MARK: config_cfm - second config-confirm = controller fully connected.
+static void ps5_l2cap_config_cfm_cback(uint16_t cid, tL2CAP_CFG_INFO* p_cfg) {
+    (void)p_cfg;
+    bool prev = is_connected;
+    is_connected = (cid == l2cap_interrupt_channel);
+    if (prev != is_connected) ps5ConnectEvent(is_connected ? 1 : 0);
+}
+
+static void ps5_l2cap_disconnect_ind_cback(uint16_t cid, bool ack_needed) {
+    is_connected = false;
+    if (ack_needed) L2CA_DisconnectRsp(cid);
+    ps5ConnectEvent(0);
+}
+
+static void ps5_l2cap_disconnect_cfm_cback(uint16_t cid, uint16_t result) {
+    ESP_LOGI(ps5_TAG, "disconnect_cfm cid=0x%02x result=%u", cid, result);
+}
+
+// MARK: data_ind - inbound HID input report; hand to parsePacket().
+static void ps5_l2cap_data_ind_cback(uint16_t cid, BT_HDR* p_buf) {
+    (void)cid;
+    if (p_buf->length > 2) {
+        /* Real L2CAP payload starts at p_buf->offset; first byte is the
+         * HIDP transaction header (0xA1 = DATA|INPUT) which parsePacket()
+         * will skip itself. */
+        parsePacket(p_buf->data + p_buf->offset);
+    }
+    osi_free(p_buf);
+}
+
+static void ps5_l2cap_congest_cback(uint16_t cid, bool congested) {
+    ESP_LOGI(ps5_TAG, "congest cid=0x%02x %d", cid, congested);
+}
+
+/* ============================================================================
+ * MARK: GAP/SPP - device-name + connectable scan-mode bring-up.
+ * ==========================================================================*/
+
+static void sppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
+    (void)param;
+    if (event == ESP_SPP_INIT_EVT) {
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    }
+}
+
+void sppInit(void) {
+    esp_err_t ret;
+    if ((ret = esp_spp_register_callback(sppCallback)) != ESP_OK) {
+        ESP_LOGE(ps5_TAG, "spp register failed: %s", esp_err_to_name(ret)); return;
+    }
+    if ((ret = esp_spp_init(ESP_SPP_MODE_CB)) != ESP_OK) {
+        ESP_LOGE(ps5_TAG, "spp init failed: %s", esp_err_to_name(ret)); return;
+    }
+}
+
+} /* extern "C" */
