@@ -82,6 +82,16 @@ bool ps5_l2cap_has_target(void) {
     return false;
 }
 
+// MARK: l2cap_get_target - copy the latched MAC out (zeros if none).
+void ps5_l2cap_get_target(uint8_t out[6]) {
+    memcpy(out, g_bd_addr, 6);
+}
+
+// MARK: l2cap_clear_target - forget the saved MAC (used by ps5.forget()).
+void ps5_l2cap_clear_target(void) {
+    memset(g_bd_addr, 0, sizeof(g_bd_addr));
+}
+
 // MARK: l2cap_init_service - register one PSM with L2CAP + Security Manager.
 static void ps5_l2cap_init_service(const char* name, uint16_t psm, uint8_t security_id) {
     if (!L2CA_Register(psm, (tL2CAP_APPL_INFO*)&dyn_info)) {
@@ -97,11 +107,6 @@ static void ps5_l2cap_init_service(const char* name, uint16_t psm, uint8_t secur
 void ps5_l2cap_init_services(void) {
     ps5_l2cap_init_service("ps5-HIDC", BT_PSM_HIDC, BTM_SEC_SERVICE_FIRST_EMPTY);
     ps5_l2cap_init_service("ps5-HIDI", BT_PSM_HIDI, BTM_SEC_SERVICE_FIRST_EMPTY + 1);
-}
-
-void ps5_l2cap_deinit_services(void) {
-    L2CA_Deregister(BT_PSM_HIDC);
-    L2CA_Deregister(BT_PSM_HIDI);
 }
 
 // MARK: l2cap_reconnect - retry the outbound HID-control L2CAP connect.
@@ -156,16 +161,30 @@ static void ps5_l2cap_config_ind_cback(uint16_t cid, tL2CAP_CFG_INFO* p_cfg) {
     L2CA_ConfigRsp(cid, p_cfg);
 }
 
-// MARK: config_cfm - second config-confirm = controller fully connected.
+// MARK: config_cfm - both channels must configure for the connection to be live.
+// Track each channel's configured state independently; only fire the up-edge
+// once both are ready, regardless of which order the stack confirms them in.
+extern void ps5_scan_cache_release(void);
+static bool       l2cap_ctrl_configured = false;
+static bool       l2cap_int_configured  = false;
 static void ps5_l2cap_config_cfm_cback(uint16_t cid, tL2CAP_CFG_INFO* p_cfg) {
     (void)p_cfg;
+    if      (cid == l2cap_control_channel)   l2cap_ctrl_configured = true;
+    else if (cid == l2cap_interrupt_channel) l2cap_int_configured  = true;
     bool prev = is_connected;
-    is_connected = (cid == l2cap_interrupt_channel);
-    if (prev != is_connected) ps5ConnectEvent(is_connected ? 1 : 0);
+    is_connected = l2cap_ctrl_configured && l2cap_int_configured;
+    if (prev != is_connected) {
+        if (is_connected) ps5_scan_cache_release();
+        ps5ConnectEvent(is_connected ? 1 : 0);
+    }
 }
 
 static void ps5_l2cap_disconnect_ind_cback(uint16_t cid, bool ack_needed) {
     is_connected = false;
+    l2cap_ctrl_configured = false;
+    l2cap_int_configured  = false;
+    l2cap_control_channel   = 0;
+    l2cap_interrupt_channel = 0;
     if (ack_needed) L2CA_DisconnectRsp(cid);
     ps5ConnectEvent(0);
 }

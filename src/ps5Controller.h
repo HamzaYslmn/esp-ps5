@@ -1,283 +1,196 @@
-/* ps5Controller.h - Arduino-friendly DualSense (PS5) controller for ESP32.
+/* ps5Controller.h - DualSense (PS5) controller for ESP32, Arduino style.
  *
- * Layered overview of the library:
- *
- *   ps5Controller.cpp   <- Arduino class, GAP/Bluedroid bring-up, scanDevices,
- *                          callbacks dispatch, reconnect loop. Holds the
- *                          ps5_t/ps5_event_t/ps5_cmd_t state for the sketch.
- *   ps5_bytes.cpp       <- ALL byte/bit work. Builds the wire-correct
- *                          DualSense BT 0x31 OUTPUT report (rumble, lightbar,
- *                          player LEDs) with trailing CRC32, and parses the
- *                          incoming BT 0x31 INPUT report (sticks, buttons,
- *                          triggers, status). Every offset is documented.
- *   ps5_l2cap.c         <- L2CAP transport (HID control PSM 0x11 + interrupt
- *                          PSM 0x13). Vendored Bluedroid plumbing.
- *   ps5_spp.c           <- Bluedroid bring-up (device name, scan mode).
- *   stack/ + osi/       <- Vendored ESP-IDF Bluedroid headers.
- *
- * If you only want to read the protocol, open ps5_bytes.cpp.
+ * Hello world:
+ *   ps5.begin();                                      // connect
+ *   while (!ps5.isConnected()) delay(10);
+ *   if (ps5.cross) ps5.lightbar(255,0,0).rumble(0,200).send();
  */
 
 #ifndef ps5Controller_h
 #define ps5Controller_h
 
-#ifdef __cplusplus
-#include "Arduino.h"
-#endif
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ============================================================ DATA TYPES */
-
-typedef struct {
-  int8_t lx, ly;   /* left  stick, signed -128..127 (centered at 0) */
-  int8_t rx, ry;   /* right stick, signed -128..127 (centered at 0) */
-} ps5_analog_stick_t;
-
-typedef struct {
-  uint8_t l2;      /* L2 trigger pressure 0..255 */
-  uint8_t r2;      /* R2 trigger pressure 0..255 */
-} ps5_analog_button_t;
-
-typedef struct {
-  ps5_analog_stick_t  stick;
-  ps5_analog_button_t button;
-} ps5_analog_t;
-
-typedef struct {
-  uint8_t right    : 1;
-  uint8_t down     : 1;
-  uint8_t up       : 1;
-  uint8_t left     : 1;
-
-  uint8_t square   : 1;
-  uint8_t cross    : 1;
-  uint8_t circle   : 1;
-  uint8_t triangle : 1;
-
-  uint8_t upright   : 1;
-  uint8_t downright : 1;
-  uint8_t upleft    : 1;
-  uint8_t downleft  : 1;
-
-  uint8_t l1 : 1;
-  uint8_t r1 : 1;
-  uint8_t l2 : 1;
-  uint8_t r2 : 1;
-
-  uint8_t share   : 1;   /* "Create" button on DualSense */
-  uint8_t options : 1;
-  uint8_t l3      : 1;
-  uint8_t r3      : 1;
-
-  uint8_t ps       : 1;
-  uint8_t touchpad : 1;
-  uint8_t mute     : 1;  /* mic-mute capacitive button */
-} ps5_button_t;
-
-typedef struct {
-  uint8_t battery       : 4;  /* 0..10 (10% steps) */
-  uint8_t charging      : 1;
-  uint8_t fully_charged : 1;
-  uint8_t headphones    : 1;
-  uint8_t mic           : 1;
-} ps5_status_t;
-
-/* Motion sensors. Raw int16 LSB; the DualSense reports gyro in deg/s
- * scaled by ~0x10000/2000 and accel in g scaled by 0x10000/8 (per kernel),
- * but we expose the raw counts so the sketch can pick its own units. */
-typedef struct {
-  int16_t x, y, z;
-} ps5_imu_t;
-
-/* One touchpad contact. The DualSense surface is 1920 x 1080. */
-typedef struct {
-  uint8_t  active;   /* 1 = finger present, 0 = lifted */
-  uint8_t  id;       /* contact id 0..127, increments per fresh touch */
-  uint16_t x;        /* 0..1919 */
-  uint16_t y;        /* 0..1079 */
-} ps5_touch_t;
-
-typedef struct {
-  ps5_imu_t   gyro;
-  ps5_imu_t   accel;
-  uint32_t    timestamp;
-  ps5_touch_t touch[2];
-} ps5_sensor_t;
-
-/* Output to controller. Caller fills these and calls sendToController(). */
-typedef struct {
-  uint8_t smallRumble;   /* high-frequency motor (right), 0..255 */
-  uint8_t largeRumble;   /* low-frequency  motor (left),  0..255 */
-  uint8_t r, g, b;       /* lightbar RGB, 0..255 each */
-  uint8_t playerLeds;    /* 5 player LEDs: bit0=far-left ... bit4=far-right */
-  uint8_t muteLed;       /* 0 = off, 1 = solid on, 2 = pulsing */
-} ps5_cmd_t;
-
-typedef struct {
-  ps5_button_t button_down;   /* edge: not-pressed -> pressed THIS packet */
-  ps5_button_t button_up;     /* edge: pressed     -> released THIS packet */
-  ps5_analog_t analog_move;   /* signed delta vs previous packet (sticks/triggers) */
-} ps5_event_t;
-
-typedef struct {
-  ps5_analog_t  analog;
-  ps5_button_t  button;
-  ps5_status_t  status;
-  ps5_sensor_t  sensor;
-  uint8_t      *latestPacket;
-} ps5_t;
-
-/* ============================================================ ARDUINO API */
-
 #ifdef __cplusplus
+#include "Arduino.h"
+
 class ps5Controller {
  public:
   typedef void (*callback_t)();
   typedef void (*scan_cb_t)(const uint8_t mac[6], const char* name, int8_t rssi);
 
-  ps5_t       data;
-  ps5_event_t event;
-  ps5_cmd_t   output;
+  /* ============================================================ INPUT.
+   * Read these like normal variables; they refresh automatically. */
 
-  /* ============================================================ FLAT API
-   * Refreshed automatically on every input packet. Just read them as
-   * plain variables — no parentheses, no nested structs.
-   *
-   *   if (ps5.cross) { ... }
-   *   int speed = ps5.ly;
-   *   float gx  = ps5.gyroX / 1024.0f;     // deg/s
-   *
-   * Conventions:
-   *   sticks  lx ly rx ry      int8   -128..+127, centered at 0  (Y is inverted: up = negative)
-   *   trigger l2 r2            uint8  0..255  (0 = released, also doubles as "pressed if > 0")
-   *   buttons                  bool
-   *   gyro*                    int16  raw, ÷ 1024 = deg/s
-   *   accel*                   int16  raw, ÷ 8192 = g  (includes gravity!)
-   *   battery                  uint8  0..10  (10% steps)
-   */
+  /* Sticks: -128..+127, centered at 0. Y is flipped (push UP = negative). */
   int8_t   lx = 0, ly = 0, rx = 0, ry = 0;
-  uint8_t  l2 = 0, r2 = 0;                           // analog trigger 0..255
-  bool     l1 = false, r1 = false, l3 = false, r3 = false;
-  bool     up = false, down = false, left = false, right = false;
+
+  /* Analog triggers: 0 = released, 255 = fully pressed. */
+  /* Analog triggers: 0 = released, 255 = fully pressed. */
+  uint8_t  l2 = 0, r2 = 0;
+
+  /* Easy percent helpers. Sticks: -100..+100 (0 centered, up = negative for Y).
+   * Triggers: 0..100. Use these if you don't want to deal with raw -128/+127 or 0/255. */
+  inline int8_t  lxPct() const { return (int8_t)((int)lx * 100 / 127); }
+  inline int8_t  lyPct() const { return (int8_t)((int)ly * 100 / 127); }
+  inline int8_t  rxPct() const { return (int8_t)((int)rx * 100 / 127); }
+  inline int8_t  ryPct() const { return (int8_t)((int)ry * 100 / 127); }
+  inline uint8_t l2Pct() const { return (uint8_t)((int)l2 * 100 / 255); }
+  inline uint8_t r2Pct() const { return (uint8_t)((int)r2 * 100 / 255); }
+
+  /* Buttons: true while held. */
+  bool     l1 = false, r1 = false, l3 = false, r3 = false;          /* shoulders + stick clicks */
+  bool     up = false, down = false, left = false, right = false;   /* D-pad */
   bool     cross = false, circle = false, square = false, triangle = false;
   bool     share = false, options = false, ps_btn = false, touchpad = false, mute = false;
-  int16_t  gyroX = 0, gyroY = 0, gyroZ = 0;
-  int16_t  accelX = 0, accelY = 0, accelZ = 0;
-  uint32_t sensorTime = 0;
+
+  /* Edge detection: returns true ONCE the moment a bool flips false->true.
+   * Works on any bool member of this class. Examples:
+   *   if (ps5.pressed (ps5.square))  { ... }   // single-shot rising edge
+   *   if (ps5.released(ps5.square))  { ... }   // single-shot falling edge
+   * Internally the library tracks each field's previous value by address. */
+  bool pressed (const bool& field);
+  bool released(const bool& field);
+
+  /* Motion sensors (raw). gyro / 1024 = deg/sec.  accel / 8192 = g.
+   * Marked volatile because parsePacket() writes from the Bluedroid task while
+   * loop() reads from the Arduino task; without volatile the compiler could
+   * cache a stale value in a register across reads. Each individual access is
+   * still subject to a one-sample tear if it lands mid-write - read three
+   * times and discard if a difference is observed if you need bit-perfect
+   * snapshots, otherwise just live with the rare 1-frame jitter. */
+  volatile int16_t  gyroX = 0, gyroY = 0, gyroZ = 0;
+  volatile int16_t  accelX = 0, accelY = 0, accelZ = 0;
+  volatile uint32_t sensorTime = 0;
+
+  /* Status. battery: 0..100 (percent). */
   uint8_t  battery = 0;
   bool     charging = false, fullyCharged = false, headphones = false, micJack = false;
 
-  /* Output shortcuts: set the field then call send(). */
-  ps5Controller& send() { sendToController(); return *this; }
+  /* Raw last-packet bytes (78 B). For debug only. Valid only just after a packet. */
+  const uint8_t* latestPacket = nullptr;
 
-  ps5Controller();
+  /* Touchpad: 2 fingers max. Surface is 1920 x 1080. x/y are volatile for the
+   * same cross-task reason as the motion fields above. */
+  struct Touch {
+    bool              active;   /* finger currently on the pad? */
+    uint8_t           id;       /* changes each time a finger lifts + touches again */
+    volatile uint16_t x, y;     /* pixel position */
+  } touch[2] = {};
+  bool     TouchActive(int i) { return touch[i & 1].active; }
+  uint8_t  TouchId    (int i) { return touch[i & 1].id; }
+  uint16_t TouchX     (int i) { return touch[i & 1].x; }
+  uint16_t TouchY     (int i) { return touch[i & 1].y; }
 
-  /* MARK: begin - bring up Bluetooth, then connect.
-   *   begin()                  -> auto-scan, connect to the FIRST DualSense seen, max 30 s.
-   *   begin(timeoutSecs)       -> same, custom timeout (e.g. ps5.begin(20)).
-   *   begin("AA:BB:..") -> connect to that specific MAC.
-   * Auto-reconnect runs every 5 s while disconnected (see isConnected()). */
-  bool begin();
-  bool begin(uint8_t timeoutSecs);
+  /* ============================================================ OUTPUT.
+   * What we WANT the controller to do next. Use the helpers below, then send().
+   * (You can also poke fields directly, e.g. ps5.output.r = 200;) */
+  struct Out {
+    uint8_t smallRumble = 0, largeRumble = 0;   /* small=sharp buzz, large=deep rumble. 0..255 */
+    uint8_t r = 0, g = 0, b = 0;                /* lightbar color, 0..255 each */
+    uint8_t playerLeds = 0;                     /* 5-bit mask, bit 0 = far-left LED */
+    uint8_t ledBrightness = 1;                  /* wire value, 0=bright,1=mid,2=dim. Set indirectly via playerLed(). */
+    uint8_t muteLed = 0;                        /* 0=off, 1=on, 2=pulse */
+    uint8_t leftTriggerMode = 0,  leftTriggerParam[10] = {0};   /* set via l2*() helpers */
+    uint8_t rightTriggerMode = 0, rightTriggerParam[10] = {0};  /* set via r2*() helpers */
+  } output;
+
+  /* ============================================================ API. */
+
+  /* Connect. First call scans + pairs; later calls fast-reconnect (saved MAC). */
+  bool begin(uint8_t timeoutSecs = 30);
+
+  /* Connect to a specific MAC, e.g. "AA:BB:CC:DD:EE:FF". Skips scanning. */
   bool begin(const char* mac);
 
-  /* MARK: scanDevices - one-shot BT Classic inquiry. cb fires per discovered
-   * device with (mac, name, rssi). Caller picks one and feeds it to begin(). */
-  bool scanDevices(uint8_t secs, scan_cb_t cb);
-
-  /* MARK: autoPair - scan up to `timeoutSecs` and connect to the first DualSense
-   * detected (early-exit, doesn't wait the full timeout). Called by begin(). */
-  bool autoPair(uint8_t timeoutSecs);
-
-  void end();
+  /* True while the controller is talking to us. Call this every loop. */
   bool isConnected();
 
-  /* Set local state. Nothing is sent until sendToController(). */
-  void setLed(uint8_t r, uint8_t g, uint8_t b);
-  void setRumble(uint8_t small, uint8_t large);
-  void setPlayerLeds(uint8_t bitmask);   /* 5 bits, bit0..bit4 */
-  void setMuteLed(uint8_t mode);         /* 0=off, 1=on, 2=pulse */
-  void sendToController();
+  /* Erase the saved MAC, so the next begin() scans for a new controller. */
+  void forget();
 
-  /* MARK: fluent api - chainable shorthand setters. Each returns *this so you
-   * can chain:  ps5.led(255,0,0).rumble(255,0).send();
-   * Identical effect to the set* methods above. */
-  ps5Controller& led(uint8_t r, uint8_t g, uint8_t b)         { setLed(r,g,b);            return *this; }
-  ps5Controller& rumble(uint8_t small, uint8_t large)         { setRumble(small,large);   return *this; }
-  ps5Controller& playerLeds(uint8_t bitmask)                  { setPlayerLeds(bitmask);   return *this; }
-  ps5Controller& muteLed(uint8_t mode)                        { setMuteLed(mode);         return *this; }
+  /* Scan for `secs` seconds. cb(mac, name, rssi) fires once per device found. */
+  bool scanDevices(uint8_t secs, scan_cb_t cb);
 
-  /* Sketch hooks. */
-  void attach(callback_t cb);
-  void attachOnConnect(callback_t cb);
-  void attachOnDisconnect(callback_t cb);
+  /* ---- Output helpers. Chainable. Nothing sent until you call send(). ---- */
 
-  uint8_t* LatestPacket() { return data.latestPacket; }
+  /* Lightbar RGB color, 0..255 each. (0,0,0) = off.
+   * Lightbar = the colored strip around the touchpad. (Player LEDs are the
+   * row of 5 white LEDs below it — use playerLed() for those.) */
+  ps5Controller& lightbar     (uint8_t r, uint8_t g, uint8_t b);
 
-  /* Convenience accessors used by sketches. */
-  bool Right()    { return data.button.right; }
-  bool Down()     { return data.button.down; }
-  bool Up()       { return data.button.up; }
-  bool Left()     { return data.button.left; }
-  bool Square()   { return data.button.square; }
-  bool Cross()    { return data.button.cross; }
-  bool Circle()   { return data.button.circle; }
-  bool Triangle() { return data.button.triangle; }
-  bool UpRight()   { return data.button.upright; }
-  bool DownRight() { return data.button.downright; }
-  bool UpLeft()    { return data.button.upleft; }
-  bool DownLeft()  { return data.button.downleft; }
-  bool L1() { return data.button.l1; }
-  bool R1() { return data.button.r1; }
-  bool L2() { return data.button.l2; }
-  bool R2() { return data.button.r2; }
-  bool Share()    { return data.button.share; }
-  bool Options()  { return data.button.options; }
-  bool L3()       { return data.button.l3; }
-  bool R3()       { return data.button.r3; }
-  bool PSButton() { return data.button.ps; }
-  bool Touchpad() { return data.button.touchpad; }
-  bool Mute()     { return data.button.mute; }
+  /* Rumble motors, 0..255. small = sharp buzz, large = deep rumble. */
+  ps5Controller& rumble       (uint8_t small, uint8_t large);
 
-  uint8_t L2Value() { return data.analog.button.l2; }
-  uint8_t R2Value() { return data.analog.button.r2; }
+  /* Light a player LED. index = 1..5 (1 = far-left, 5 = far-right).
+   * value sets BOTH on/off and brightness:
+   *   0          = off
+   *   1          = on, dim
+   *   2          = on, medium
+   *   3 or more  = on, bright (255 also works)
+   * Chain freely: ps5.playerLed(1, 3).playerLed(3, 3).playerLed(5, 3).send(); */
+  ps5Controller& playerLed    (uint8_t index, uint8_t value);
 
-  int8_t LStickX() { return data.analog.stick.lx; }
-  int8_t LStickY() { return data.analog.stick.ly; }
-  int8_t RStickX() { return data.analog.stick.rx; }
-  int8_t RStickY() { return data.analog.stick.ry; }
+  /* Mic-mute LED.  0 = off,  1 = on,  2 = pulse. */
+  ps5Controller& muteLed      (uint8_t mode);
 
-  uint8_t Battery()      { return data.status.battery; }
-  bool    Charging()     { return data.status.charging; }
-  bool    FullyCharged() { return data.status.fully_charged; }
-  bool    Headphones()   { return data.status.headphones; }
-  bool    MicJack()      { return data.status.mic; }
+  /* Send everything you set above. Call at most once per 10 ms. */
+  ps5Controller& send();
 
-  /* Motion + touchpad accessors. */
-  int16_t GyroX()  { return data.sensor.gyro.x; }
-  int16_t GyroY()  { return data.sensor.gyro.y; }
-  int16_t GyroZ()  { return data.sensor.gyro.z; }
-  int16_t AccelX() { return data.sensor.accel.x; }
-  int16_t AccelY() { return data.sensor.accel.y; }
-  int16_t AccelZ() { return data.sensor.accel.z; }
-  uint32_t SensorTimestamp() { return data.sensor.timestamp; }
+  /* ---- Adaptive triggers (L2 / R2). ----
+   * All percents are 0..100. freqHz is real Hz (try 5..30). Pick ONE mode per
+   * trigger; L2 and R2 are independent so you can mix two:
+   *   ps5.l2Trigger(20,80,100).r2Pulse(30,100,15).send();
+   *
+   * Basic:
+   *   l2Off()                                  - no force.
+   *   l2Rigid(start, strength)                 - stiff wall past `start`.
+   *   l2Trigger(start, end, strength)          - gun-trigger squeeze + click.
+   *   l2Pulse(start, strength, freqHz)         - vibrating buzz past `start`.
+   *
+   * Combo (firmware presets - effectively two effects at once):
+   *   l2Bow(start, end, strength, snap)        - squeeze + snap-back at the end.
+   *   l2Galloping(start, end, foot1, foot2, freqHz) - horse-gallop rhythm.
+   *   l2Machine(start, end, ampA, ampB, freqHz, periodTenths)
+   *      Buzz inside [start..end]; strength swaps between ampA and ampB every
+   *      `periodTenths` (in 0.1 s units, so 5 = 0.5 s).
+   *
+   * r2*() are the same for the right trigger. */
+  ps5Controller& l2Off();
+  ps5Controller& l2Rigid    (uint8_t start, uint8_t strength);
+  ps5Controller& l2Trigger  (uint8_t start, uint8_t end, uint8_t strength);
+  ps5Controller& l2Pulse    (uint8_t start, uint8_t strength, uint8_t freqHz);
+  ps5Controller& l2Bow      (uint8_t start, uint8_t end, uint8_t strength, uint8_t snap);
+  ps5Controller& l2Galloping(uint8_t start, uint8_t end, uint8_t foot1, uint8_t foot2, uint8_t freqHz);
+  ps5Controller& l2Machine  (uint8_t start, uint8_t end, uint8_t ampA, uint8_t ampB, uint8_t freqHz, uint8_t periodTenths);
+  ps5Controller& r2Off();
+  ps5Controller& r2Rigid    (uint8_t start, uint8_t strength);
+  ps5Controller& r2Trigger  (uint8_t start, uint8_t end, uint8_t strength);
+  ps5Controller& r2Pulse    (uint8_t start, uint8_t strength, uint8_t freqHz);
+  ps5Controller& r2Bow      (uint8_t start, uint8_t end, uint8_t strength, uint8_t snap);
+  ps5Controller& r2Galloping(uint8_t start, uint8_t end, uint8_t foot1, uint8_t foot2, uint8_t freqHz);
+  ps5Controller& r2Machine  (uint8_t start, uint8_t end, uint8_t ampA, uint8_t ampB, uint8_t freqHz, uint8_t periodTenths);
 
-  /* idx = 0 (first finger) or 1 (second finger). */
-  bool     TouchActive(int idx) { return data.sensor.touch[idx & 1].active; }
-  uint8_t  TouchId    (int idx) { return data.sensor.touch[idx & 1].id; }
-  uint16_t TouchX     (int idx) { return data.sensor.touch[idx & 1].x; }
-  uint16_t TouchY     (int idx) { return data.sensor.touch[idx & 1].y; }
+  /* ---- Callbacks (optional). Pass a `void myFn()` function. ---- */
+  void attach            (callback_t cb) { _onPacket     = cb; }  /* every packet (~250 Hz) */
+  void attachOnConnect   (callback_t cb) { _onConnect    = cb; }  /* once, when controller wakes up */
+  void attachOnDisconnect(callback_t cb) { _onDisconnect = cb; }  /* when controller drops */
 
-  /* Internal: invoked by the C-side dispatchers. Public so extern "C" glue
-   * can call them; sketches should not. */
-  static void _event_callback(void* obj, ps5_t d, ps5_event_t e);
-  static void _connection_callback(void* obj, uint8_t isConnected);
+  /* Internal - called by the C-side dispatchers in ps5_bytes.cpp / bluedroid.cpp. */
+  void _fireInput()             { if (_onPacket)     _onPacket(); }
+  void _fireConnState(bool up)  { if (up) { if (_onConnect) _onConnect(); }
+                                  else    { if (_onDisconnect) _onDisconnect(); } }
 
  private:
-  callback_t _callback_event      = nullptr;
-  callback_t _callback_connect    = nullptr;
-  callback_t _callback_disconnect = nullptr;
+  callback_t _onPacket = nullptr, _onConnect = nullptr, _onDisconnect = nullptr;
+
+  /* Per-field previous-state tracker for pressed()/released(). 24 slots covers
+   * the 17 button bools plus typical user-added bools; on overflow the oldest
+   * entry is recycled. Lookup is by address of the bool field. */
+  struct EdgeSlot { const bool* p; bool prev; };
+  EdgeSlot _edges[24] = {};
+  bool*    _edgePrev(const bool& field);   /* returns ptr into _edges entry, allocating if new */
 };
 
 #ifndef NO_GLOBAL_INSTANCES
@@ -286,44 +199,36 @@ extern ps5Controller ps5;
 
 #endif /* __cplusplus */
 
-/* ============================================================ INTERNAL C API
- *
- * These symbols are exported by ps5_bytes.cpp and ps5Controller.cpp with
- * C linkage so the C-only files (ps5_l2cap.c, ps5_spp.c) can call them.
- * Sketches don't need to touch any of this.
- */
+/* ============================================================ INTERNAL C API.
+ * Sketches don't need any of this. Used by the layers to talk to each other. */
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* hid_cmd_t: outbound HID-over-L2CAP buffer.
- * data[0] = HID transaction header byte (0xA2 for OUTPUT, 0x53 for SET_FEATURE).
- * data[1..] = HID report id then payload.
- * length    = number of valid bytes in data[].
- */
-#define ps5_SEND_BUFFER_SIZE 80   /* DualSense BT OUTPUT = 0xA2 + 78 bytes + (4-byte CRC is part of 78) */
-typedef struct {
-  uint8_t data[ps5_SEND_BUFFER_SIZE];
-  uint8_t length;
-} hid_cmd_t;
+/* Outbound HID-over-L2CAP buffer.
+ *   data[0] = HID transaction header (0xA2 OUTPUT / 0x53 SET_FEATURE).
+ *   data[1..] = HID report id then payload. */
+#define ps5_SEND_BUFFER_SIZE 80
+typedef struct { uint8_t data[ps5_SEND_BUFFER_SIZE]; uint8_t length; } hid_cmd_t;
 
-/* Implemented in ps5_bytes.cpp */
-void     parsePacket(uint8_t* packet);
-uint32_t ps5_crc32(uint32_t seed, const uint8_t* buf, uint16_t len);
+/* ps5_bytes.cpp */
+void parsePacket(uint8_t* p);            /* writes flat fields on global ps5, fires _fireInput */
+void ps5BuildAndSend(void);              /* reads ps5.output, builds frame, sends on interrupt PSM */
+void ps5Enable(void);                    /* SET_FEATURE 0xF4 handshake on control PSM */
 
-/* Implemented in ps5Controller.cpp */
-void ps5ConnectEvent(uint8_t isConnected);
-void ps5PacketEvent(ps5_t ps5, ps5_event_t event);
+/* ps5Controller.cpp */
+void ps5ConnectEvent(uint8_t isConnected);   /* called by L2CAP on link up/down */
 
-/* Implemented in bluedroid/bluedroid.cpp */
+/* bluedroid/bluedroid.cpp */
 void  sppInit(void);
 void  ps5_l2cap_init_services(void);
-void  ps5_l2cap_deinit_services(void);
 long  ps5_l2cap_connect(uint8_t addr[6]);
 long  ps5_l2cap_reconnect(void);
 bool  ps5_l2cap_has_target(void);
-void  ps5_l2cap_send_hid          (hid_cmd_t* cmd, uint8_t len); /* control PSM 0x11   */
-void  ps5_l2cap_send_hid_interrupt(hid_cmd_t* cmd, uint8_t len); /* interrupt PSM 0x13 */
+void  ps5_l2cap_get_target(uint8_t out[6]);
+void  ps5_l2cap_clear_target(void);
+void  ps5_l2cap_send_hid          (hid_cmd_t* c, uint8_t len);  /* control PSM 0x11   */
+void  ps5_l2cap_send_hid_interrupt(hid_cmd_t* c, uint8_t len);  /* interrupt PSM 0x13 */
 
 #ifdef __cplusplus
 }

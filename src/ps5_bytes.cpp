@@ -138,25 +138,27 @@
  * byte the controller signs along with the rest of the payload.
  * ============================================================================
  */
-
 #include "ps5Controller.h"
 #include <string.h>
 
+extern "C" void ps5_mark_alive(void);   /* defined in ps5Controller.cpp */
+
 /* ============================================================ wire offsets */
 
-/* OUTPUT (sent on HID interrupt channel): absolute wire offsets. */
-enum {
+enum { /* OUTPUT */
   WO_HID_HDR        = 0,   /* 0xA2 */
   WO_REPORT_ID      = 1,   /* 0x31 */
   WO_SEQ_TAG        = 2,
   WO_TAG            = 3,   /* 0x10 */
-
-  /* dualsense_output_report_common starts at 4 */
   WO_VALID_FLAG0    = 4,
   WO_VALID_FLAG1    = 5,
   WO_MOTOR_RIGHT    = 6,
   WO_MOTOR_LEFT     = 7,
   WO_MUTE_LED       = 12,
+  WO_R2_TRIG_MODE   = 14,  /* +10 param bytes */
+  WO_R2_TRIG_PARAM  = 15,
+  WO_L2_TRIG_MODE   = 25,  /* +10 param bytes */
+  WO_L2_TRIG_PARAM  = 26,
   WO_VALID_FLAG2    = 42,
   WO_LIGHTBAR_SETUP = 45,
   WO_LED_BRIGHTNESS = 46,
@@ -164,163 +166,147 @@ enum {
   WO_LIGHTBAR_R     = 48,
   WO_LIGHTBAR_G     = 49,
   WO_LIGHTBAR_B     = 50,
-
-  WO_CRC32          = 75,  /* CRC covers bytes [0..74] */
+  WO_CRC32          = 75,  /* CRC covers [0..74] */
   WO_TOTAL          = 79
 };
 
 /* OUTPUT valid_flag bits (Linux kernel naming) */
 #define VF0_COMPATIBLE_VIBRATION   0x01
 #define VF0_HAPTICS_SELECT         0x02
+#define VF0_R2_TRIGGER_ENABLE      0x04
+#define VF0_L2_TRIGGER_ENABLE      0x08
 #define VF1_MIC_MUTE_LED_ENABLE    0x01
 #define VF1_LIGHTBAR_ENABLE        0x04
 #define VF1_PLAYER_LED_ENABLE      0x10
-#define VF2_LIGHTBAR_SETUP_ENABLE  0x02
-#define LIGHTBAR_SETUP_LIGHT_OUT   0x02   /* cancel startup fade */
+#define VF2_LIGHT_BRIGHTNESS_ENABLE 0x01  /* gates byte 46 (player LED brightness) */
+#define VF2_LIGHTBAR_SETUP_ENABLE  0x02  /* gates byte 45 (lightbar fade-in cancel) */
+#define LIGHTBAR_SETUP_LIGHT_OUT   0x02
 
-/* INPUT (received on HID interrupt channel): absolute wire offsets. */
-enum {
-  WI_REPORT_ID    = 0,    /* 0x31 */
-  WI_TAG          = 1,    /* reserved */
-  WI_LX           = 2,
-  WI_LY           = 3,
-  WI_RX           = 4,
-  WI_RY           = 5,
-  WI_L2_TRIGGER   = 6,
-  WI_R2_TRIGGER   = 7,
-  WI_SEQ_NUMBER   = 8,
-  WI_BTN0         = 9,    /* hat + face buttons */
-  WI_BTN1         = 10,   /* L1/R1/L2/R2/Share/Options/L3/R3 */
-  WI_BTN2         = 11,   /* PS / touchpad / mute */
-  WI_GYRO_X       = 17,   /* int16 LE x3 */
-  WI_ACCEL_X      = 23,   /* int16 LE x3 */
-  WI_TIMESTAMP    = 29,   /* uint32 LE */
-  WI_TOUCH0       = 34,   /* 4 bytes per contact */
-  WI_TOUCH1       = 38,
-  WI_STATUS0      = 54,   /* battery + charging */
-  WI_STATUS1      = 55    /* HP/MIC detect, MIC mute */
+enum { /* INPUT */
+  WI_LX = 2, WI_LY, WI_RX, WI_RY,
+  WI_L2_TRIGGER = 6, WI_R2_TRIGGER,
+  WI_BTN0 = 9, WI_BTN1, WI_BTN2,
+  WI_GYRO_X    = 17,
+  WI_ACCEL_X   = 23,
+  WI_TIMESTAMP = 29,
+  WI_TOUCH0    = 34, WI_TOUCH1 = 38,
+  WI_STATUS0   = 54, WI_STATUS1 = 55
 };
 
-/* INPUT bits */
-#define BTN0_HAT_MASK     0x0F
-#define BTN0_SQUARE       0x10
-#define BTN0_CROSS        0x20
-#define BTN0_CIRCLE       0x40
-#define BTN0_TRIANGLE     0x80
-#define BTN1_L1           0x01
-#define BTN1_R1           0x02
-#define BTN1_L2           0x04
-#define BTN1_R2           0x08
-#define BTN1_CREATE       0x10   /* "Share" */
-#define BTN1_OPTIONS      0x20
-#define BTN1_L3           0x40
-#define BTN1_R3           0x80
-#define BTN2_PS_HOME      0x01
-#define BTN2_TOUCHPAD     0x02
-#define BTN2_MIC_MUTE     0x04
-#define STATUS0_BATTERY   0x0F
-#define STATUS0_CHARGING  0xF0
-#define STATUS1_HP        0x01
-#define STATUS1_MIC       0x02
-#define STATUS1_MIC_MUTE  0x04
+#define BTN0_HAT_MASK   0x0F
+#define BTN0_SQUARE     0x10
+#define BTN0_CROSS      0x20
+#define BTN0_CIRCLE     0x40
+#define BTN0_TRIANGLE   0x80
+#define BTN1_L1         0x01
+#define BTN1_R1         0x02
+#define BTN1_L2         0x04
+#define BTN1_R2         0x08
+#define BTN1_CREATE     0x10
+#define BTN1_OPTIONS    0x20
+#define BTN1_L3         0x40
+#define BTN1_R3         0x80
+#define BTN2_PS_HOME    0x01
+#define BTN2_TOUCHPAD   0x02
+#define BTN2_MIC_MUTE   0x04
+#define STATUS0_BATTERY 0x0F
+#define STATUS0_CHARGING 0xF0
+#define STATUS1_HP      0x01
+#define STATUS1_MIC     0x02
 
-/* CRC32 seeds used by the DualSense (kept here for reference; we feed the
- * 0xA2 byte as the first byte of `buf` so we don't apply the seed manually). */
+/* ============================================================ CRC32 (zlib) */
 
-/* ============================================================ CRC32 */
-
-/* Reflected CRC-32 (poly 0xEDB88320, init 0xFFFFFFFF, xorout 0xFFFFFFFF).
- * Same algorithm as zlib / Ethernet / Linux's crc32_le. */
-static uint32_t crc32_table[256];
-static bool     crc32_table_ready = false;
-
-static void crc32_init_table() {
-  for (uint32_t i = 0; i < 256; i++) {
-    uint32_t c = i;
-    for (int j = 0; j < 8; j++)
-      c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-    crc32_table[i] = c;
-  }
-  crc32_table_ready = true;
+/* Compile-time CRC32 table (zlib polynomial 0xEDB88320, reflected). Lives in
+ * flash via constexpr+const, so it costs 0 B RAM (vs 1 KB for the runtime
+ * version we used to lazy-init on first send). */
+static constexpr uint32_t crc32_byte(uint32_t c) {
+  return (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
 }
+static constexpr uint32_t crc32_step(uint32_t c, int n) {
+  return n == 0 ? c : crc32_step(crc32_byte(c), n - 1);
+}
+#define CRC32_E(i) crc32_step((uint32_t)(i), 8)
+#define CRC32_R4(i) CRC32_E(i),     CRC32_E(i+1),   CRC32_E(i+2),   CRC32_E(i+3)
+#define CRC32_R16(i) CRC32_R4(i),   CRC32_R4(i+4),  CRC32_R4(i+8),  CRC32_R4(i+12)
+#define CRC32_R64(i) CRC32_R16(i),  CRC32_R16(i+16),CRC32_R16(i+32),CRC32_R16(i+48)
+static const uint32_t crc32_table[256] = {
+  CRC32_R64(0), CRC32_R64(64), CRC32_R64(128), CRC32_R64(192)
+};
+#undef CRC32_E
+#undef CRC32_R4
+#undef CRC32_R16
+#undef CRC32_R64
 
-extern "C" uint32_t ps5_crc32(uint32_t seed, const uint8_t* buf, uint16_t len) {
-  if (!crc32_table_ready) crc32_init_table();
-  uint32_t c = seed ^ 0xFFFFFFFFu;
+static uint32_t crc32_le(const uint8_t* buf, uint16_t len) {
+  uint32_t c = 0xFFFFFFFFu;
   for (uint16_t i = 0; i < len; i++)
     c = crc32_table[(c ^ buf[i]) & 0xFF] ^ (c >> 8);
   return c ^ 0xFFFFFFFFu;
 }
 
-/* ============================================================ output report */
+/* ============================================================ output (build) */
 
-static uint8_t out_seq = 0;  /* 4-bit sequence number; increments per report */
+static uint8_t out_seq = 0;   /* 4-bit sequence */
 
-/* Build and send the DualSense BT 0x31 OUTPUT report on the HID interrupt
- * channel. Sketch supplies state via the `cmd` parameter; we wrap it in the
- * full wire layout, append CRC32, hand it to L2CAP. */
-extern "C" void ps5Cmd(ps5_cmd_t cmd) {
+extern "C" void ps5BuildAndSend(void) {
   hid_cmd_t out = {};
+  uint8_t* d = out.data;
 
   /* HID-over-L2CAP framing */
-  out.data[WO_HID_HDR]   = 0xA2;
-  out.data[WO_REPORT_ID] = 0x31;
-  out.data[WO_SEQ_TAG]   = (uint8_t)((out_seq & 0x0F) << 4);
-  out.data[WO_TAG]       = 0x10;
+  d[WO_HID_HDR]   = 0xA2;
+  d[WO_REPORT_ID] = 0x31;
+  d[WO_SEQ_TAG]   = (uint8_t)((out_seq & 0x0F) << 4);
+  d[WO_TAG]       = 0x10;
   out_seq = (uint8_t)((out_seq + 1) & 0x0F);
 
-  /* Tell controller which fields we are setting */
-  out.data[WO_VALID_FLAG0] = VF0_COMPATIBLE_VIBRATION | VF0_HAPTICS_SELECT;
-  out.data[WO_VALID_FLAG1] = VF1_LIGHTBAR_ENABLE
-                           | VF1_PLAYER_LED_ENABLE
-                           | VF1_MIC_MUTE_LED_ENABLE;
-  out.data[WO_VALID_FLAG2] = VF2_LIGHTBAR_SETUP_ENABLE;
+  d[WO_VALID_FLAG0] = VF0_COMPATIBLE_VIBRATION | VF0_HAPTICS_SELECT
+                    | VF0_R2_TRIGGER_ENABLE   | VF0_L2_TRIGGER_ENABLE;
+  d[WO_VALID_FLAG1] = VF1_LIGHTBAR_ENABLE | VF1_PLAYER_LED_ENABLE | VF1_MIC_MUTE_LED_ENABLE;
+  d[WO_VALID_FLAG2] = VF2_LIGHTBAR_SETUP_ENABLE | VF2_LIGHT_BRIGHTNESS_ENABLE;
 
-  /* Rumble */
-  out.data[WO_MOTOR_RIGHT] = cmd.smallRumble;   /* high-freq */
-  out.data[WO_MOTOR_LEFT]  = cmd.largeRumble;   /* low-freq  */
+  const ps5Controller::Out& o = ps5.output;
+  d[WO_MOTOR_RIGHT]    = o.smallRumble;
+  d[WO_MOTOR_LEFT]     = o.largeRumble;
+  d[WO_MUTE_LED]       = o.muteLed;
+  d[WO_LIGHTBAR_SETUP] = LIGHTBAR_SETUP_LIGHT_OUT;
+  d[WO_LIGHTBAR_R]     = o.r;
+  d[WO_LIGHTBAR_G]     = o.g;
+  d[WO_LIGHTBAR_B]     = o.b;
+  d[WO_LED_BRIGHTNESS] = (o.ledBrightness > 2) ? 2 : o.ledBrightness;
+  d[WO_PLAYER_LEDS]    = o.playerLeds & 0x1F;
 
-  /* Mic-mute LED (0=off, 1=solid, 2=pulse) */
-  out.data[WO_MUTE_LED] = cmd.muteLed;
+  d[WO_R2_TRIG_MODE] = o.rightTriggerMode;
+  memcpy(&d[WO_R2_TRIG_PARAM], o.rightTriggerParam, 10);
+  d[WO_L2_TRIG_MODE] = o.leftTriggerMode;
+  memcpy(&d[WO_L2_TRIG_PARAM], o.leftTriggerParam,  10);
 
-  /* Lightbar */
-  out.data[WO_LIGHTBAR_SETUP] = LIGHTBAR_SETUP_LIGHT_OUT;
-  out.data[WO_LIGHTBAR_R]     = cmd.r;
-  out.data[WO_LIGHTBAR_G]     = cmd.g;
-  out.data[WO_LIGHTBAR_B]     = cmd.b;
-
-  /* Player LEDs */
-  out.data[WO_LED_BRIGHTNESS] = 1;                   /* mid brightness */
-  out.data[WO_PLAYER_LEDS]    = cmd.playerLeds & 0x1F;
-
-  /* Trailing CRC32 (covers bytes [0..74], i.e. everything before the CRC) */
-  uint32_t crc = ps5_crc32(0, out.data, WO_CRC32);
-  out.data[WO_CRC32 + 0] = (uint8_t)(crc      );
-  out.data[WO_CRC32 + 1] = (uint8_t)(crc >>  8);
-  out.data[WO_CRC32 + 2] = (uint8_t)(crc >> 16);
-  out.data[WO_CRC32 + 3] = (uint8_t)(crc >> 24);
+  uint32_t crc = crc32_le(d, WO_CRC32);
+  d[WO_CRC32 + 0] = (uint8_t)(crc      );
+  d[WO_CRC32 + 1] = (uint8_t)(crc >>  8);
+  d[WO_CRC32 + 2] = (uint8_t)(crc >> 16);
+  d[WO_CRC32 + 3] = (uint8_t)(crc >> 24);
 
   out.length = WO_TOTAL;
   ps5_l2cap_send_hid_interrupt(&out, WO_TOTAL);
 }
 
-/* Enable handshake: SET_REPORT(FEATURE, 0xF4) with payload {0x43, 0x02} on the
- * HID *control* channel. This flips the controller from short USB-style
- * report 0x01 to full BT 0x31 input streaming. Must be sent right after
- * the L2CAP interrupt channel comes up. */
+/* SET_REPORT(FEATURE, 0xF4) {0x43, 0x02} on the HID *control* channel.
+ * Flips the controller from short USB-style report 0x01 to full BT 0x31. */
 extern "C" void ps5Enable(void) {
   hid_cmd_t cmd = {};
-  cmd.data[0] = 0x53;          /* SET_REPORT | type FEATURE */
-  cmd.data[1] = 0xF4;          /* feature report id */
-  cmd.data[2] = 0x43;          /* magic byte 1 */
-  cmd.data[3] = 0x02;          /* magic byte 2 */
+  cmd.data[0] = 0x53;   /* SET_REPORT | type FEATURE */
+  cmd.data[1] = 0xF4;
+  cmd.data[2] = 0x43;
+  cmd.data[3] = 0x02;
   cmd.length  = 4;
   ps5_l2cap_send_hid(&cmd, 4);
 }
 
 /* ============================================================ input parser */
 
-/* Hat switch (D-pad) decode table. Order matches kernel ps_gamepad_hat_mapping. */
+/* HAT (D-pad) decode. Order matches kernel ps_gamepad_hat_mapping.
+ *  index = N, NE, E, SE, S, SW, W, NW, neutral. We expose the four cardinals
+ *  plus the four diagonals so a sketch can do `ps5.up && ps5.right` for NE. */
 struct HatBits { uint8_t up, right, down, left, ne, se, sw, nw; };
 static const HatBits HAT_DECODE[9] = {
   /* 0=N      */ {1,0,0,0, 0,0,0,0},
@@ -334,126 +320,88 @@ static const HatBits HAT_DECODE[9] = {
   /* 8=center */ {0,0,0,0, 0,0,0,0},
 };
 
-static ps5_t prev_state = {};
-
-static ps5_event_t computeEdges(const ps5_t& prev, const ps5_t& cur) {
-  ps5_event_t ev = {};
-  #define EDGE(field) do { \
-    ev.button_down.field = !prev.button.field &&  cur.button.field; \
-    ev.button_up.field   =  prev.button.field && !cur.button.field; \
-  } while (0)
-
-  EDGE(up); EDGE(right); EDGE(down); EDGE(left);
-  EDGE(upright); EDGE(downright); EDGE(upleft); EDGE(downleft);
-  EDGE(square); EDGE(cross); EDGE(circle); EDGE(triangle);
-  EDGE(l1); EDGE(r1); EDGE(l2); EDGE(r2);
-  EDGE(share); EDGE(options); EDGE(l3); EDGE(r3);
-  EDGE(ps); EDGE(touchpad); EDGE(mute);
-  #undef EDGE
-
-  ev.analog_move.stick.lx = (int8_t)(cur.analog.stick.lx - prev.analog.stick.lx);
-  ev.analog_move.stick.ly = (int8_t)(cur.analog.stick.ly - prev.analog.stick.ly);
-  ev.analog_move.stick.rx = (int8_t)(cur.analog.stick.rx - prev.analog.stick.rx);
-  ev.analog_move.stick.ry = (int8_t)(cur.analog.stick.ry - prev.analog.stick.ry);
-  ev.analog_move.button.l2 = (uint8_t)(cur.analog.button.l2 - prev.analog.button.l2);
-  ev.analog_move.button.r2 = (uint8_t)(cur.analog.button.r2 - prev.analog.button.r2);
-  return ev;
-}
-
 extern "C" void parsePacket(uint8_t* p) {
-  /* Strip the HIDP DATA|INPUT transaction header (0xA1) if present, so the
-   * rest of this function can use absolute wire offsets where p[0] is the
-   * report ID 0x31. */
+  /* Strip the HIDP DATA|INPUT transaction header (0xA1) if present. */
   if (p[0] == 0xA1) p++;
 
-  ps5_t s = {};
+  /* Sticks: 0..255 (128 = center) -> signed int8 by raw-minus-128. The DualSense
+   * wire already has up=low-raw and down=high-raw, so the same formula on X and
+   * Y gives the documented convention: push UP = negative, push DOWN = positive,
+   * push RIGHT = positive, push LEFT = negative. */
+  ps5.lx = (int8_t)((int)p[WI_LX] - 128);
+  ps5.ly = (int8_t)((int)p[WI_LY] - 128);
+  ps5.rx = (int8_t)((int)p[WI_RX] - 128);
+  ps5.ry = (int8_t)((int)p[WI_RY] - 128);
+  ps5.l2 = p[WI_L2_TRIGGER];
+  ps5.r2 = p[WI_R2_TRIGGER];
 
-  /* Sticks: convert 0..255 (128 = center) to signed int8.
-   * Y axes are inverted on PS controllers (0 = up). */
-  s.analog.stick.lx = (int8_t)((int)p[WI_LX] - 128);
-  s.analog.stick.ly = (int8_t)(127 - (int)p[WI_LY]);
-  s.analog.stick.rx = (int8_t)((int)p[WI_RX] - 128);
-  s.analog.stick.ry = (int8_t)(127 - (int)p[WI_RY]);
-  s.analog.button.l2 = p[WI_L2_TRIGGER];
-  s.analog.button.r2 = p[WI_R2_TRIGGER];
+  uint8_t b0 = p[WI_BTN0], b1 = p[WI_BTN1], b2 = p[WI_BTN2];
 
-  uint8_t b0 = p[WI_BTN0];
-  uint8_t b1 = p[WI_BTN1];
-  uint8_t b2 = p[WI_BTN2];
-
-  /* D-pad */
+  /* D-pad - we expose the four cardinals; diagonals are derivable as e.g.
+   * (ps5.up && ps5.right). Neutral = all four false. */
   uint8_t hat = b0 & BTN0_HAT_MASK;
   if (hat > 8) hat = 8;
   const HatBits& h = HAT_DECODE[hat];
-  s.button.up = h.up; s.button.right = h.right;
-  s.button.down = h.down; s.button.left = h.left;
-  s.button.upright = h.ne; s.button.downright = h.se;
-  s.button.downleft = h.sw; s.button.upleft = h.nw;
+  ps5.up    = h.up || h.ne || h.nw;
+  ps5.down  = h.down || h.se || h.sw;
+  ps5.right = h.right || h.ne || h.se;
+  ps5.left  = h.left || h.nw || h.sw;
 
-  /* Face buttons */
-  s.button.square   = (b0 & BTN0_SQUARE)   ? 1 : 0;
-  s.button.cross    = (b0 & BTN0_CROSS)    ? 1 : 0;
-  s.button.circle   = (b0 & BTN0_CIRCLE)   ? 1 : 0;
-  s.button.triangle = (b0 & BTN0_TRIANGLE) ? 1 : 0;
+  ps5.square   = (b0 & BTN0_SQUARE);
+  ps5.cross    = (b0 & BTN0_CROSS);
+  ps5.circle   = (b0 & BTN0_CIRCLE);
+  ps5.triangle = (b0 & BTN0_TRIANGLE);
 
-  /* Shoulder + meta */
-  s.button.l1      = (b1 & BTN1_L1)      ? 1 : 0;
-  s.button.r1      = (b1 & BTN1_R1)      ? 1 : 0;
-  s.button.l2      = (b1 & BTN1_L2)      ? 1 : 0;
-  s.button.r2      = (b1 & BTN1_R2)      ? 1 : 0;
-  s.button.share   = (b1 & BTN1_CREATE)  ? 1 : 0;
-  s.button.options = (b1 & BTN1_OPTIONS) ? 1 : 0;
-  s.button.l3      = (b1 & BTN1_L3)      ? 1 : 0;
-  s.button.r3      = (b1 & BTN1_R3)      ? 1 : 0;
+  ps5.l1      = (b1 & BTN1_L1);
+  ps5.r1      = (b1 & BTN1_R1);
+  /* Digital L2/R2 booleans are exposed via the analog l2/r2 fields:
+   * "pressed if > 0". Bits BTN1_L2/R2 carry the same info, so we drop
+   * them rather than expose two duplicated representations. */
+  ps5.share   = (b1 & BTN1_CREATE);
+  ps5.options = (b1 & BTN1_OPTIONS);
+  ps5.l3      = (b1 & BTN1_L3);
+  ps5.r3      = (b1 & BTN1_R3);
+  ps5.ps_btn  = (b2 & BTN2_PS_HOME);
+  ps5.touchpad= (b2 & BTN2_TOUCHPAD);
+  ps5.mute    = (b2 & BTN2_MIC_MUTE);
 
-  s.button.ps       = (b2 & BTN2_PS_HOME)  ? 1 : 0;
-  s.button.touchpad = (b2 & BTN2_TOUCHPAD) ? 1 : 0;
-  s.button.mute     = (b2 & BTN2_MIC_MUTE) ? 1 : 0;
+  /* Motion (raw int16 LE). Kernel scale: gyro/1024 deg/s, accel/8192 g. */
+  ps5.gyroX  = (int16_t)(p[WI_GYRO_X + 0] | (p[WI_GYRO_X + 1] << 8));
+  ps5.gyroY  = (int16_t)(p[WI_GYRO_X + 2] | (p[WI_GYRO_X + 3] << 8));
+  ps5.gyroZ  = (int16_t)(p[WI_GYRO_X + 4] | (p[WI_GYRO_X + 5] << 8));
+  ps5.accelX = (int16_t)(p[WI_ACCEL_X + 0] | (p[WI_ACCEL_X + 1] << 8));
+  ps5.accelY = (int16_t)(p[WI_ACCEL_X + 2] | (p[WI_ACCEL_X + 3] << 8));
+  ps5.accelZ = (int16_t)(p[WI_ACCEL_X + 4] | (p[WI_ACCEL_X + 5] << 8));
+  ps5.sensorTime = (uint32_t)p[WI_TIMESTAMP + 0]
+                 | ((uint32_t)p[WI_TIMESTAMP + 1] << 8)
+                 | ((uint32_t)p[WI_TIMESTAMP + 2] << 16)
+                 | ((uint32_t)p[WI_TIMESTAMP + 3] << 24);
 
-  /* Motion sensors: gyro + accel as int16 little-endian.
-   * Verified byte-for-byte against Linux kernel
-   *   struct dualsense_input_report { ...; __le16 gyro[3]; __le16 accel[3]; ... }
-   * Values are RAW (uncalibrated). Kernel scale: gyro / 1024 deg/s,
-   * accel / 8192 g. Gyro semantics: x=PITCH, y=YAW, z=ROLL. */
-  s.sensor.gyro.x  = (int16_t)(p[WI_GYRO_X + 0] | (p[WI_GYRO_X + 1] << 8));  /* pitch */
-  s.sensor.gyro.y  = (int16_t)(p[WI_GYRO_X + 2] | (p[WI_GYRO_X + 3] << 8));  /* yaw   */
-  s.sensor.gyro.z  = (int16_t)(p[WI_GYRO_X + 4] | (p[WI_GYRO_X + 5] << 8));  /* roll  */
-  s.sensor.accel.x = (int16_t)(p[WI_ACCEL_X + 0] | (p[WI_ACCEL_X + 1] << 8));
-  s.sensor.accel.y = (int16_t)(p[WI_ACCEL_X + 2] | (p[WI_ACCEL_X + 3] << 8));
-  s.sensor.accel.z = (int16_t)(p[WI_ACCEL_X + 4] | (p[WI_ACCEL_X + 5] << 8));
-  s.sensor.timestamp = (uint32_t)p[WI_TIMESTAMP + 0]
-                     | ((uint32_t)p[WI_TIMESTAMP + 1] << 8)
-                     | ((uint32_t)p[WI_TIMESTAMP + 2] << 16)
-                     | ((uint32_t)p[WI_TIMESTAMP + 3] << 24);
-
-  /* Touchpad: two contact slots, 4 bytes each.
-   *   byte 0: bit 7 = inactive (1 = lifted), bits 0..6 = contact id
+  /* Touchpad: 4 bytes per contact.
+   *   byte 0: bit7 inactive (1=lifted), bits 0..6 = id
    *   byte 1: x[7:0]
-   *   byte 2: y[3:0] | x[11:8]<<4 (low nibble = x_high, high nibble = y_low)
-   *   byte 3: y[11:4]                                                       */
+   *   byte 2: low nibble = x[11:8], high nibble = y[3:0]
+   *   byte 3: y[11:4] */
   for (int i = 0; i < 2; i++) {
     const uint8_t* tp = p + (i == 0 ? WI_TOUCH0 : WI_TOUCH1);
-    s.sensor.touch[i].active = (tp[0] & 0x80) ? 0 : 1;
-    s.sensor.touch[i].id     = tp[0] & 0x7F;
-    s.sensor.touch[i].x      = (uint16_t)tp[1] | ((uint16_t)(tp[2] & 0x0F) << 8);
-    s.sensor.touch[i].y      = ((uint16_t)tp[2] >> 4) | ((uint16_t)tp[3] << 4);
+    ps5.touch[i].active = !(tp[0] & 0x80);
+    ps5.touch[i].id     = tp[0] & 0x7F;
+    ps5.touch[i].x      = (uint16_t)tp[1] | ((uint16_t)(tp[2] & 0x0F) << 8);
+    ps5.touch[i].y      = ((uint16_t)tp[2] >> 4) | ((uint16_t)tp[3] << 4);
   }
 
-  /* Status: battery + charging */
-  uint8_t st0 = p[WI_STATUS0];
-  uint8_t st1 = p[WI_STATUS1];
+  /* Status */
+  uint8_t st0 = p[WI_STATUS0], st1 = p[WI_STATUS1];
   uint8_t batt = st0 & STATUS0_BATTERY;
   uint8_t chg  = (st0 & STATUS0_CHARGING) >> 4;
   if (batt > 10) batt = 10;
-  s.status.battery       = batt;
-  s.status.charging      = (chg == 1);
-  s.status.fully_charged = (chg == 2);
-  s.status.headphones    = (st1 & STATUS1_HP)  ? 1 : 0;
-  s.status.mic           = (st1 & STATUS1_MIC) ? 1 : 0;
+  ps5.battery      = (uint8_t)(batt * 10);     /* 0..10 raw -> 0..100 %% */
+  ps5.charging     = (chg == 1);
+  ps5.fullyCharged = (chg == 2);
+  ps5.headphones   = (st1 & STATUS1_HP);
+  ps5.micJack      = (st1 & STATUS1_MIC);
 
-  s.latestPacket = p;
+  ps5.latestPacket = p;
 
-  ps5_event_t ev = computeEdges(prev_state, s);
-  prev_state = s;
-  ps5PacketEvent(s, ev);
+  ps5_mark_alive();
 }

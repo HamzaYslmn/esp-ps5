@@ -13,7 +13,7 @@ void setup() {
 
 void loop() {
   if (!ps5.isConnected()) return;
-  if (ps5.cross) ps5.rumble(255, 0).led(255, 0, 0).send();
+  if (ps5.cross) ps5.rumble(255, 0).lightbar(255, 0, 0).send();
   int speed = ps5.ly;       // -128..+127, up = negative
   int trig  = ps5.r2;       //   0..255
   delay(50);
@@ -37,6 +37,7 @@ void loop() {
    - [Touchpad](#touchpad)
    - [Battery & jacks](#battery--jacks)
    - [Outputs (chainable)](#outputs-chainable)
+   - [Adaptive triggers](#adaptive-triggers)
 5. [Things to watch for](#things-to-watch-for)
 6. [Wire format reference](#wire-format-reference)
 7. [Files](#files)
@@ -80,6 +81,8 @@ void loop() {
 
 **Auto-reconnect** is built in: if the controller goes out of range or sleeps, the library quietly retries every 5 s in the background. Your sketch keeps running.
 
+**Persistent re-pairing**: the first time a controller successfully connects, its MAC is saved to NVS. On the next boot, `ps5.begin()` skips the BT inquiry and fast-connects directly (~1 s). Falls back to a full scan if the saved controller is unreachable. Call `ps5.forget()` to wipe the saved MAC — useful when switching to a different controller.
+
 ---
 
 ## API reference
@@ -91,6 +94,7 @@ void loop() {
 | `ps5.begin([timeout])` | `bool` | Auto-scan + pair. |
 | `ps5.begin(mac)` | `bool` | Pair a specific MAC. |
 | `ps5.isConnected()` | `bool` | Live link state. Auto-reconnect runs while `false`. |
+| `ps5.forget()` | — | Erase the saved MAC from NVS so the next `begin()` re-scans. |
 | `ps5.attach(cb)` | — | `void cb()` fires on every input packet (~250 Hz). |
 | `ps5.attachOnConnect(cb)` | — | Fires once when the link comes up. |
 | `ps5.attachOnDisconnect(cb)` | — | Fires once when the link drops. |
@@ -106,6 +110,13 @@ void loop() {
 | `ps5.rx` `ps5.ry` | `int8` | `-128 … +127` | Right stick, same convention. |
 | `ps5.l2` `ps5.r2` | `uint8` | `0 … 255` | Analog trigger. Doubles as "pressed" if `> 0`. |
 
+Don't want to deal with raw `-128..+127` / `0..255`? Use the percent helpers:
+
+| Helper | Range |
+|---|---|
+| `ps5.lxPct()` `ps5.lyPct()` `ps5.rxPct()` `ps5.ryPct()` | `-100 … +100` |
+| `ps5.l2Pct()` `ps5.r2Pct()` | `0 … 100` |
+
 ### Buttons
 
 All booleans. `true` while held.
@@ -118,7 +129,7 @@ All booleans. `true` while held.
 | **Stick clicks** | `ps5.l3`  `ps5.r3` |
 | **System** | `ps5.share`  `ps5.options`  `ps5.ps_btn`  `ps5.touchpad`  `ps5.mute` |
 
-> Press / release **edges** (one packet only): `ps5.event.button_down.cross`, `ps5.event.button_up.cross`, etc.
+> **Edge detection.** Use `ps5.pressed(ps5.square)` for a one-shot rising edge (fires once when `false → true`) and `ps5.released(ps5.square)` for the falling edge. Works on any button bool, e.g. `if (ps5.pressed(ps5.l1)) { ... }`. The library tracks previous state internally — no shadow variables in your sketch.
 
 ### Motion sensors
 
@@ -143,7 +154,7 @@ The touchpad surface is **1920 × 1080**. Two simultaneous fingers, indexed `0` 
 
 | Field | Type | Meaning |
 |---|---|---|
-| `ps5.battery` | `uint8` | `0 … 10` (×10 % steps) |
+| `ps5.battery` | `uint8` | `0 … 100` (percent) |
 | `ps5.charging` | `bool` | USB power detected |
 | `ps5.fullyCharged` | `bool` | Battery at 100 % |
 | `ps5.headphones` | `bool` | 3.5 mm jack inserted |
@@ -151,25 +162,57 @@ The touchpad surface is **1920 × 1080**. Two simultaneous fingers, indexed `0` 
 
 ### Outputs (chainable)
 
-Each setter returns `*this` so you can chain everything into one statement, then `.send()`.
+Each setter returns `*this`, so you can chain everything into one statement and finish with `.send()`.
 
 ```cpp
-ps5.led(255, 0, 0)              // RGB lightbar, 0..255 each
-   .rumble(255, 0)              // small (high-freq), large (low-freq), 0..255
-   .playerLeds(0b00100)         // 5-bit mask, bit0=far-left … bit4=far-right
+ps5.lightbar(255, 0, 0)         // RGB lightbar around touchpad, 0..255 each
+   .rumble(255, 0)              // small (sharp buzz), large (deep rumble), 0..255
+   .playerLed(3, 3)             // turn on LED 3 at brightness 3 (1=dim, 2=mid, 3+=bright). 0 = off
    .muteLed(2)                  // 0 = off, 1 = solid, 2 = pulse
+   .l2Trigger(20, 80, 100)      // see Adaptive triggers below
    .send();
 ```
 
 | Method | Effect |
 |---|---|
-| `.led(r, g, b)` | RGB lightbar |
-| `.rumble(small, large)` | Small motor (high-freq) + large motor (low-freq) |
-| `.playerLeds(mask)` | 5-bit mask along the bottom strip |
+| `.lightbar(r, g, b)` | RGB lightbar (the colored strip around the touchpad) |
+| `.rumble(small, large)` | small = sharp buzz, large = deep rumble |
+| `.playerLed(index, value)` | Light one of the 5 white LEDs below the touchpad. `index` 1..5 (1 = far-left). `value`: `0` = off, `1` = dim, `2` = mid, `3` (or any ≥3) = bright. Chain freely: `ps5.playerLed(1,3).playerLed(3,3).playerLed(5,3).send();`. **Note:** the controller has only one global brightness register, so the *last non-zero `value`* before `send()` sets brightness for every lit LED. Pass `value=0` to turn a LED off without changing the others' brightness. For a raw 5-bit mask: `ps5.output.playerLeds = 0b10101; ps5.send();` |
 | `.muteLed(mode)` | 0 = off, 1 = solid, 2 = pulse |
-| `.send()` | Push everything to the controller |
+| `.send()` | Push everything to the controller (call at most once per 10 ms) |
 
-> Older sketches using `setLed()` / `setRumble()` / `sendToController()` and `LStickY()` / `Cross()` / `AccelX()` etc. still compile; new code should prefer the field + chained style.
+### Adaptive triggers
+
+The DualSense triggers have little motors inside. Each trigger (L2 / R2) plays **one** effect at a time. L2 and R2 are independent — you can run different effects on each.
+
+All position / strength values are **percent (0..100)**. `freqHz` is real Hz (try 5..30).
+
+```cpp
+ps5.l2Trigger(20, 80, 100)      // gun-trigger squeeze + click on left
+   .r2Pulse(30, 100, 15)        // buzzing right trigger
+   .send();
+```
+
+#### Basic effects
+
+| Method | Feels like | Args |
+|---|---|---|
+| `.l2Off()` / `.r2Off()` | Normal trigger, no force | — |
+| `.l2Rigid(start, strength)` | Stiff wall past `start` | start %, strength % |
+| `.l2Trigger(start, end, strength)` | Gun-trigger squeeze with click at the end | start %, end %, strength % |
+| `.l2Pulse(start, strength, freqHz)` | Buzzing past `start` | start %, strength %, freq Hz |
+
+#### Combo effects (firmware presets — two effects fused into one)
+
+| Method | Feels like | Args |
+|---|---|---|
+| `.l2Bow(start, end, strength, snap)` | Squeeze + snap-back at the end | start %, end %, strength %, snap % |
+| `.l2Galloping(start, end, foot1, foot2, freqHz)` | Horse-gallop two-beat rhythm | start %, end %, foot1 %, foot2 %, freq Hz |
+| `.l2Machine(start, end, ampA, ampB, freqHz, periodTenths)` | Buzz that swaps strength every `periodTenths × 0.1 s` | start %, end %, ampA %, ampB %, freq Hz, period in tenths |
+
+`r2*` versions are identical for the right trigger.
+
+> Want two basic effects on the **same** trigger (e.g. "trigger + pulse")? You can't — only one mode block per trigger. Use `l2Machine` (buzz inside a range) for the closest equivalent, or run different effects on L2 vs R2.
 
 ---
 
@@ -269,7 +312,6 @@ examples/testEverything/   full-feature sketch + 1 Hz serial snapshot
 
 **License:** LGPL-3.0 — see [`LICENSE`](LICENSE).
 
-**Credits**
-- Sony DualSense controller — Sony Interactive Entertainment.
-- Wire-format reference: [Linux kernel `drivers/hid/hid-playstation.c`](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-playstation.c).
-- L2CAP / BTM glue inspired by the original esp32-ps3 port.
+**Author:** [hamzayslmn](https://github.com/hamzayslmn)
+
+DualSense, PlayStation, and PS5 are trademarks of Sony Interactive Entertainment. This library is an independent, unofficial implementation and is not affiliated with or endorsed by Sony.
