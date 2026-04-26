@@ -200,21 +200,13 @@ respond from. The intended flow is:
 The ESP32 keeps its factory BT MAC; the MAC passed to `begin()` is the
 *controller's* address used to connect *to*.
 
-### NVS persistence (auto-reconnect without re-pairing)
-
-The first time a controller goes fully alive (first input packet arrives),
-`ps5_mark_alive()` reads the latched target MAC out of bluedroid via
-`ps5_l2cap_get_target()` and writes it to NVS under namespace `"ps5"`,
-key `"mac"` (6-byte blob).
-
-On the next boot, `ps5.begin(timeoutSecs)` reads that MAC back and fires a
-direct outbound L2CAP connect, waits up to 4 s for the controller to come
-alive, and only falls back to a full BT inquiry if the saved MAC doesn't
-respond. Result: a previously-paired DualSense reconnects in ~1 s without
-re-pairing.
-
-Call `ps5.forget()` to wipe the NVS entry and clear bluedroid's latched
-MAC — useful when switching to a different controller.
+Note: pairing keys (link keys) are stored by Bluedroid itself in its own
+NVS area, so a paired DualSense stays paired across reboots without us
+needing to track its MAC. On every boot, `begin(timeoutSecs)` runs a
+fresh BT inquiry; the moment any device named "DualSense" or
+"Wireless Controller" appears, the scan early-exits and the L2CAP
+connect fires. `ps5.forget()` clears the in-RAM target so the next
+`begin()` re-scans from scratch.
 
 ## Memory / CPU notes
 
@@ -272,7 +264,7 @@ MAC — useful when switching to a different controller.
   NVS (`ps5`/`mac`) the first time a packet arrives, so subsequent
   `begin()` calls skip the BT inquiry and fast-connect directly. Falls
   back to a full scan if the saved controller is unreachable.
-  `ps5.forget()` wipes the entry.
+  `ps5.forget()` wipes the entry. *(Removed 2026-05-01 — see below.)*
 
 ## Fixed (2026-04-28)
 
@@ -341,3 +333,41 @@ MAC — useful when switching to a different controller.
   missing `*/` and silently swallowed the `playerLed()` declaration,
   giving sketches a `'class ps5Controller' has no member named 'playerLed'`
   link error. Fixed by closing the comment.
+
+## Fixed (2026-05-01)
+
+- **TX freezes after a brief link blip ("DOWN -> UP -> no TX")**:
+  `disconnect_ind_cback` was wiping BOTH channels' state on every callback,
+  but Bluedroid fires that callback PER CHANNEL. A blip on just one channel
+  would also wipe the still-alive channel's CID. On the partial reconnect
+  that followed, only the affected channel re-handshaked; the other's CID
+  stayed at 0. RX kept working (Bluedroid routes inbound by its own internal
+  lookup, `data_ind_cback` doesn't consult our stored CID), but `send()`
+  silently dropped every frame against the cid==0 guard.
+  **Fix**: only clear the CID + configured flag for the channel that was
+  actually torn down; only fire `ps5ConnectEvent(0)` on the up->down edge.
+  No mutex/locking needed - the partial-clear alone closes the bug.
+- **Auto-reconnect "keeps disconnecting/reconnecting" loop**: `isConnected()`
+  was firing `ps5_l2cap_reconnect()` (== outbound `L2CA_CONNECT_REQ` on HIDC)
+  every 5 s whenever `g_active==false`, even when the L2CAP channels were
+  already up but the first input packet hadn't landed yet (the gap between
+  `ps5ConnectEvent(1)` and `ps5_mark_alive()`), or when only one channel had
+  blipped and the other was still alive. The duplicate outbound connect
+  confuses Bluedroid into tearing the existing link down -> repeats forever.
+  **Fix**: exposed `ps5_l2cap_is_active()` (returns `is_connected`, i.e. both
+  channels configured) and gated the 5-s reconnect on `!ps5_l2cap_is_active()`,
+  so the retry only fires when the link is genuinely down.
+- **`begin(saved-MAC)` fallback racing the active link**: was waiting on
+  `g_active` (first input packet) with a 4-s deadline before falling back to a
+  BT inquiry scan. If channels came up but the first packet was slow, the
+  fallback would start `esp_bt_gap_start_discovery` while a connection was
+  in flight, disrupting it. **Fix**: wait on `ps5_l2cap_is_active()` instead
+  (channels-up is the right "saved MAC responded" signal) and bumped the
+  deadline to 8 s for a known-paired controller to power-on + handshake.
+- **NVS removed (KISS)**: the MAC-persistence layer (`nvsEnsure` / `macSave`
+  / `macLoad` / `macErase` + the `begin()` saved-MAC fast path) was deleted.
+  Bluedroid keeps the link key in its own NVS area, so a paired DualSense
+  stays paired across reboots regardless. Every `begin(timeoutSecs)` now
+  just runs a fresh inquiry that early-exits on the first DualSense match
+  (~1–3 s typical). Saves ~50 lines + the `nvs_flash` dependency.
+  `ps5.forget()` simplified to just clearing bluedroid's in-RAM target.

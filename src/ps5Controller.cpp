@@ -16,12 +16,8 @@
 #include <esp_bt_main.h>
 #include <esp_gap_bt_api.h>
 #include <esp_log.h>
-#include <nvs.h>
-#include <nvs_flash.h>
 
 #define ps5_TAG "ps5"
-#define ps5_NVS_NS  "ps5"
-#define ps5_NVS_KEY "mac"
 
 #define ESP_BD_ADDR_HEX_PTR(a) \
   (uint8_t*)(a)+0,(uint8_t*)(a)+1,(uint8_t*)(a)+2, \
@@ -30,55 +26,6 @@
 /* ============================================================ link state */
 
 static bool g_active = false;   /* true once first input packet has arrived */
-
-/* ============================================================ NVS MAC store
- *
- * The DualSense pairs to whatever BT MAC last spoke "console" to it. Once a
- * given controller has bonded with this ESP32, its address never changes
- * (unless the user re-runs sixaxispairer against a different host). So we
- * stash the MAC in NVS the first time a link goes fully active, and on the
- * next boot ps5.begin() can skip the scan entirely and fire a direct
- * L2CAP connect to the known MAC. */
-
-static bool nvsEnsure() {
-  static bool done = false;
-  if (done) return true;
-  esp_err_t e = nvs_flash_init();
-  if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    nvs_flash_erase();
-    e = nvs_flash_init();
-  }
-  done = (e == ESP_OK);
-  return done;
-}
-
-static bool macLoad(uint8_t out[6]) {
-  if (!nvsEnsure()) return false;
-  nvs_handle_t h;
-  if (nvs_open(ps5_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
-  size_t sz = 6;
-  esp_err_t e = nvs_get_blob(h, ps5_NVS_KEY, out, &sz);
-  nvs_close(h);
-  return (e == ESP_OK && sz == 6);
-}
-
-static void macSave(const uint8_t mac[6]) {
-  if (!nvsEnsure()) return;
-  nvs_handle_t h;
-  if (nvs_open(ps5_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-  nvs_set_blob(h, ps5_NVS_KEY, mac, 6);
-  nvs_commit(h);
-  nvs_close(h);
-}
-
-static void macErase() {
-  if (!nvsEnsure()) return;
-  nvs_handle_t h;
-  if (nvs_open(ps5_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-  nvs_erase_key(h, ps5_NVS_KEY);
-  nvs_commit(h);
-  nvs_close(h);
-}
 
 /* MARK: ps5ConnectEvent - C-side dispatcher.
  *   1 = link up   -> kick the SET_FEATURE handshake so the controller starts
@@ -96,14 +43,10 @@ extern "C" void ps5ConnectEvent(uint8_t up) {
 }
 
 /* Called from parsePacket() once per input report. First call doubles as the
- * real "controller is alive" moment - that's when we fire onConnect AND
- * persist the MAC to NVS so the next boot can skip the scan. */
+ * real "controller is alive" moment - that's when we fire onConnect. */
 extern "C" void ps5_mark_alive(void) {
   if (!g_active) {
     g_active = true;
-    uint8_t mac[6];
-    ps5_l2cap_get_target(mac);
-    macSave(mac);
     ps5._fireConnState(true);
   }
   ps5._fireInput();
@@ -222,6 +165,9 @@ namespace {
   }
 }
 
+/* User-driven scan: runs a BT inquiry for `secs` seconds and calls `cb` for
+ * every UNIQUE device seen. Use it to build a UI/debug list of nearby BT
+ * devices. Does NOT auto-connect. (For auto-connect use `begin()`.) */
 bool ps5Controller::scanDevices(uint8_t secs, scan_cb_t cb) {
   bool ok = runScan(secs, cb, nullptr);
   seenClear();   /* user-driven scan: drop the dedupe list before returning */
@@ -258,24 +204,14 @@ namespace {
 
 /* ============================================================ begin / connect */
 
+/* Bring the whole stack up and auto-connect to the first DualSense found.
+ * Scans for up to `timeoutSecs` (default ~20s) but EARLY-EXITS the moment
+ * a device named "DualSense" / "Wireless Controller" is seen, so typical
+ * connect time is ~1-3 s. Returns true if the bring-up succeeded; the
+ * actual connection completes asynchronously - poll `ps5.isConnected()`. */
 bool ps5Controller::begin(uint8_t timeoutSecs) {
   if (!ensureBT()) return false;
   ensureServices();
-
-  /* Fast path: a previously-paired controller's MAC is in NVS. Try it first
-   * and give it a few seconds to come up before falling back to a full scan. */
-  uint8_t saved[6];
-  if (!ps5_l2cap_has_target() && macLoad(saved)) {
-    log_i("ps5.begin(): trying saved MAC %02x:%02x:%02x:%02x:%02x:%02x",
-          saved[0],saved[1],saved[2],saved[3],saved[4],saved[5]);
-    ps5_l2cap_connect(saved);
-    uint32_t deadline = millis() + 4000UL;
-    while (millis() < deadline) {
-      if (g_active) return true;
-      vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    log_w("ps5.begin(): saved MAC didn't respond, falling back to scan");
-  }
 
   if (!ps5_l2cap_has_target()) {
     log_i("ps5.begin(): scanning up to %us for a DualSense...", timeoutSecs);
@@ -287,11 +223,18 @@ bool ps5Controller::begin(uint8_t timeoutSecs) {
   return true;
 }
 
+/* Drop the latched controller MAC from RAM so the next `begin()` re-scans
+ * from scratch. Useful when switching to a different DualSense. (The link
+ * key itself stays in Bluedroid's NVS; this only clears our target ptr.) */
 void ps5Controller::forget() {
-  macErase();
   ps5_l2cap_clear_target();
 }
 
+/* Connect to a SPECIFIC controller by its BT MAC string ("AA:BB:CC:DD:EE:FF").
+ * Skips the inquiry scan and fires a direct outbound L2CAP connect, then
+ * BLOCKS up to 10 s waiting for the first input packet. Returns true on
+ * success, false on parse error or timeout. Useful when you already know
+ * which DualSense you want and don't want any scanning at all. */
 bool ps5Controller::begin(const char* mac) {
   esp_bd_addr_t addr;
   if (sscanf(mac, ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX_PTR(addr)) != ESP_BD_ADDR_LEN) {
@@ -309,8 +252,17 @@ bool ps5Controller::begin(const char* mac) {
   return false;
 }
 
+/* Returns true while the controller is streaming input packets. Doubles as
+ * the auto-reconnect heartbeat: when disconnected, fires one outbound
+ * L2CAP CONNECT_REQ every 5 s. Call from `loop()`. */
 bool ps5Controller::isConnected() {
   if (g_active) return true;
+  /* Don't fire L2CA_CONNECT_REQ while channels are already up or mid-handshake.
+   * A duplicate outbound connect during the brief window between channels-up
+   * and first-packet (or during a one-channel blip whose other side is still
+   * alive) confuses Bluedroid into tearing the link down again -> reconnect
+   * loop. Only retry when the link is fully down. */
+  if (ps5_l2cap_is_active()) return false;
   static uint32_t tryAt = 0;
   if (millis() - tryAt > 5000UL) { tryAt = millis(); ps5_l2cap_reconnect(); }
   return false;
@@ -318,12 +270,17 @@ bool ps5Controller::isConnected() {
 
 /* ============================================================ output (fluent) */
 
+/* Set lightbar RGB (0..255 each). Stages into output buffer; call send(). */
 ps5Controller& ps5Controller::lightbar(uint8_t r, uint8_t g, uint8_t b) {
   output.r = r; output.g = g; output.b = b; return *this;
 }
+/* Set rumble strength. small = high-freq motor (right grip), large = low-
+ * freq motor (left grip), 0..255. Stages; call send(). */
 ps5Controller& ps5Controller::rumble(uint8_t small, uint8_t large) {
   output.smallRumble = small; output.largeRumble = large; return *this;
 }
+/* Player LED #index (1..5, left to right). value=0 turns that LED off;
+ * value 1=dim, 2=mid, 3+=bright. Brightness is shared by ALL on LEDs. */
 ps5Controller& ps5Controller::playerLed(uint8_t index, uint8_t value) {
   if (index < 1 || index > 5) return *this;
   uint8_t bit = (uint8_t)(1u << (index - 1));
@@ -337,9 +294,14 @@ ps5Controller& ps5Controller::playerLed(uint8_t index, uint8_t value) {
   }
   return *this;
 }
+/* Mic-mute LED: 0=off, 1=on, 2=pulse. */
 ps5Controller& ps5Controller::muteLed(uint8_t mode) {
   output.muteLed = mode; return *this;
 }
+/* Build the 79-byte BT 0x31 OUTPUT report from the staged `output` struct
+ * (lightbar, rumble, player LEDs, mute LED, adaptive triggers) and write
+ * it on the HID interrupt PSM. No-op if not fully connected. Don't call
+ * faster than ~10 ms apart or the L2CAP TX queue congests. */
 ps5Controller& ps5Controller::send() {
   /* Don't write to L2CAP unless the controller is fully alive. Sending during
    * the half-connected window (or after a remote-initiated tear-down that we
@@ -359,12 +321,17 @@ bool* ps5Controller::_edgePrev(const bool& field) {
   _edges[0].p = addr; _edges[0].prev = false;
   return &_edges[0].prev;
 }
+/* Returns true ONLY on the input packet where `field` went false->true.
+ * Lets sketches do `if (ps5.pressed(ps5.cross)) ...` without their own
+ * `wasCross` shadow flag. Tracks per-field state in a 24-slot LRU table
+ * keyed by the bool's address. */
 bool ps5Controller::pressed(const bool& field) {
   bool* prev = _edgePrev(field);
   bool edge = (field && !*prev);
   *prev = field;
   return edge;
 }
+/* Mirror of pressed(): true ONLY on the packet where `field` went true->false. */
 bool ps5Controller::released(const bool& field) {
   bool* prev = _edgePrev(field);
   bool edge = (!field && *prev);
@@ -535,6 +502,17 @@ inline void buildMachine(uint8_t* m, uint8_t* p, uint8_t startPct, uint8_t endPc
 }
 } // namespace
 
+/* Adaptive trigger setters. All take percent units (0..100) for positions
+ * and strengths. Each call REPLACES the trigger's current effect (only one
+ * mode per trigger per frame). L2 and R2 are independent - you can mix
+ * different modes on each. Stages into output; call send().
+ *   *Off()       - free trigger, no resistance.
+ *   *Rigid()     - solid wall from `start` onwards at `strength`.
+ *   *Trigger()   - sharp break between `start` and `end` zones.
+ *   *Pulse()     - vibration pulses at `freqHz` between zones.
+ *   *Bow()       - Trigger + extra snap-back (combo).
+ *   *Galloping() - rhythmic pulses bounded by zones (combo).
+ *   *Machine()   - Trigger range + Pulse oscillating between two amps. */
 ps5Controller& ps5Controller::l2Off()                                                    { buildOff      (&output.leftTriggerMode, output.leftTriggerParam); return *this; }
 ps5Controller& ps5Controller::l2Rigid  (uint8_t s, uint8_t f)                            { buildFeedback (&output.leftTriggerMode, output.leftTriggerParam, s, f); return *this; }
 ps5Controller& ps5Controller::l2Trigger(uint8_t s, uint8_t e, uint8_t f)                 { buildWeapon   (&output.leftTriggerMode, output.leftTriggerParam, s, e, f); return *this; }

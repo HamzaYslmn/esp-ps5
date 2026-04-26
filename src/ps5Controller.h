@@ -225,6 +225,7 @@ void  ps5_l2cap_init_services(void);
 long  ps5_l2cap_connect(uint8_t addr[6]);
 long  ps5_l2cap_reconnect(void);
 bool  ps5_l2cap_has_target(void);
+bool  ps5_l2cap_is_active(void);   /* both HID L2CAP channels configured */
 void  ps5_l2cap_get_target(uint8_t out[6]);
 void  ps5_l2cap_clear_target(void);
 void  ps5_l2cap_send_hid          (hid_cmd_t* c, uint8_t len);  /* control PSM 0x11   */

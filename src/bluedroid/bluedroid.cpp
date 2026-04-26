@@ -77,6 +77,8 @@ static uint16_t   l2cap_control_channel   = 0;
 static uint16_t   l2cap_interrupt_channel = 0;
 
 // MARK: l2cap_has_target - true once a MAC has been latched (via connect()).
+bool ps5_l2cap_is_active(void) { return is_connected; }
+
 bool ps5_l2cap_has_target(void) {
     for (int i = 0; i < 6; i++) if (g_bd_addr[i]) return true;
     return false;
@@ -180,13 +182,20 @@ static void ps5_l2cap_config_cfm_cback(uint16_t cid, tL2CAP_CFG_INFO* p_cfg) {
 }
 
 static void ps5_l2cap_disconnect_ind_cback(uint16_t cid, bool ack_needed) {
-    is_connected = false;
-    l2cap_ctrl_configured = false;
-    l2cap_int_configured  = false;
-    l2cap_control_channel   = 0;
-    l2cap_interrupt_channel = 0;
+    /* Bluedroid fires disconnect_ind PER CHANNEL. A momentary blip on one
+     * channel does NOT mean the other is dead - if we wipe both CIDs every
+     * time, then on the partial reconnect that follows, only the affected
+     * channel re-handshakes; the other's CID stays at 0 and send() silently
+     * drops every frame even though RX still works (Bluedroid routes RX by
+     * its own internal lookup). That's the "DOWN -> UP -> no TX" bug.
+     * So: only clear the channel that actually disconnected, and only fire
+     * ps5ConnectEvent(0) on the up->down edge. */
+    bool prev_up = is_connected;
+    if (cid == l2cap_control_channel)   { l2cap_control_channel   = 0; l2cap_ctrl_configured = false; }
+    if (cid == l2cap_interrupt_channel) { l2cap_interrupt_channel = 0; l2cap_int_configured  = false; }
+    is_connected = l2cap_ctrl_configured && l2cap_int_configured;
     if (ack_needed) L2CA_DisconnectRsp(cid);
-    ps5ConnectEvent(0);
+    if (prev_up && !is_connected) ps5ConnectEvent(0);
 }
 
 static void ps5_l2cap_disconnect_cfm_cback(uint16_t cid, uint16_t result) {

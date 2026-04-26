@@ -1,26 +1,28 @@
 # esp-ps5
 
-**Pair a Sony DualSense (PS5) controller to an ESP32 over Bluetooth Classic.**
-Simple, robust, dependency-free. One header, one global object — that's it.
+**Use a Sony DualSense (PS5) controller from an ESP32 over Bluetooth Classic.**
+One header, one global object, no callbacks, no boilerplate — just read fields and chain output setters.
 
 ```cpp
 #include <ps5Controller.h>
 
 void setup() {
   Serial.begin(115200);
-  ps5.begin();              // auto-scan, connect to the first DualSense seen
+  ps5.begin(20);   // scan up to 20 s, auto-connect to the first DualSense seen
 }
 
 void loop() {
-  if (!ps5.isConnected()) return;
-  if (ps5.cross) ps5.rumble(255, 0).lightbar(255, 0, 0).send();
-  int speed = ps5.ly;       // -128..+127, up = negative
-  int trig  = ps5.r2;       //   0..255
-  delay(50);
+  if (!ps5.isConnected()) return;            // auto-reconnects in the background
+
+  if (ps5.pressed(ps5.cross)) Serial.println("X pressed!");
+  if (ps5.l1)                 ps5.lightbar(255, 0, 0).rumble(180, 0).send();
+  else                        ps5.lightbar(0, 0, 0).rumble(0, 0).send();
+
+  delay(20);   // don't call .send() faster than ~10 ms
 }
 ```
 
-> Tags: **PS5** · **DualSense** · **ESP32** · **ESP** · **Bluetooth Classic** · **Gamepad** · **Sony** · **HID**
+> Tags: **PS5** · **DualSense** · **ESP32** · **Bluetooth Classic** · **Gamepad** · **Sony** · **HID**
 
 ---
 
@@ -33,6 +35,7 @@ void loop() {
    - [Connection](#connection)
    - [Sticks & triggers](#sticks--triggers)
    - [Buttons](#buttons)
+   - [Edge detection](#edge-detection)
    - [Motion sensors](#motion-sensors)
    - [Touchpad](#touchpad)
    - [Battery & jacks](#battery--jacks)
@@ -52,9 +55,9 @@ void loop() {
 | Arduino-ESP32 core | **3.3.6** (= ESP-IDF 5.5.2) |
 | Boards | **ESP32-WROOM-32D**, **ESP32-WROOM-32U** |
 | Partition scheme | **Huge APP** (mandatory — Bluedroid is large) |
-| Controller firmware | DualSense BT 0x31 protocol (any current FW) |
+| Controller firmware | DualSense BT 0x31 (any current FW) |
 
-**Verified working on hardware:** pairing · auto-reconnect · all buttons · both sticks · both triggers (digital + analog) · D-pad · touchpad button · mic-mute capacitive button · both rumble motors · RGB lightbar · all 5 player LEDs · mic-mute LED · gyroscope · accelerometer · both touchpad fingers · battery percentage · charging state · headphone-jack detect · mic-jack detect.
+**Verified on hardware:** pairing · auto-reconnect · all buttons · both sticks · both triggers (digital + analog) · D-pad · touchpad button · mic-mute capacitive button · both rumble motors · RGB lightbar · all 5 player LEDs · mic-mute LED · gyroscope · accelerometer · both touchpad fingers · battery percentage · charging state · headphone-jack detect · mic-jack detect · all 7 adaptive trigger modes.
 
 ---
 
@@ -69,53 +72,54 @@ void loop() {
 
 ## Pair the controller
 
-1. Hold **PS + Create** for 3 seconds — the lightbar pulses white.
-2. Call `ps5.begin()` in `setup()`.
-3. The library scans Bluetooth Classic and **connects the moment** any DualSense / Wireless Controller is seen — no need to know the MAC.
+**First time only:** flash the ESP32's Bluetooth MAC into the controller using [`sixaxispairer`](https://github.com/user-none/sixaxispairer) (or any equivalent tool) over USB. After that, the DualSense will accept connections from this ESP32 forever.
+
+**Every boot:**
+
+1. Hold **PS + Create** for ~3 s — the lightbar pulses white (controller is now advertising).
+2. Call `ps5.begin(timeoutSecs)` in `setup()`.
+3. The library scans Bluetooth Classic and **early-exits the moment** any device named *DualSense* or *Wireless Controller* is seen (~1–3 s typical), then connects.
 
 | Call | Behaviour |
 |---|---|
-| `ps5.begin()` | Auto-scan, default timeout **30 s**, connect on first match. |
-| `ps5.begin(20)` | Same, but only scan up to **20 s**. |
-| `ps5.begin("AA:BB:CC:DD:EE:FF")` | Connect to a specific MAC (skip scan). |
+| `ps5.begin(20)` | Scan up to **20 s**, connect to first DualSense found. |
+| `ps5.begin("AA:BB:CC:DD:EE:FF")` | Connect to a specific MAC (skip the inquiry). |
+| `ps5.forget()` | Drop the latched controller MAC; the next `begin()` re-scans. |
 
-**Auto-reconnect** is built in: if the controller goes out of range or sleeps, the library quietly retries every 5 s in the background. Your sketch keeps running.
+> **Reconnect is automatic.** If the controller goes out of range, sleeps, or browses away, the library quietly fires a fresh L2CAP connect every 5 s in the background. Your `loop()` just keeps polling `ps5.isConnected()`.
 
-**Persistent re-pairing**: the first time a controller successfully connects, its MAC is saved to NVS. On the next boot, `ps5.begin()` skips the BT inquiry and fast-connects directly (~1 s). Falls back to a full scan if the saved controller is unreachable. Call `ps5.forget()` to wipe the saved MAC — useful when switching to a different controller.
+> **Pairing keys persist across reboots.** Bluedroid stores the link key in its own NVS area, so once paired, you don't need to re-pair on every power-up — just hold PS+Create to wake the controller.
 
 ---
 
 ## API reference
 
+> **No callbacks. No event objects. Just fields.** Inputs are plain public fields on the global `ps5` instance, refreshed every input packet (~250 Hz). Read them like ordinary variables.
+
 ### Connection
 
-| Member | Type | What it does |
+| Member | Returns | What it does |
 |---|---|---|
-| `ps5.begin([timeout])` | `bool` | Auto-scan + pair. |
-| `ps5.begin(mac)` | `bool` | Pair a specific MAC. |
-| `ps5.isConnected()` | `bool` | Live link state. Auto-reconnect runs while `false`. |
-| `ps5.forget()` | — | Erase the saved MAC from NVS so the next `begin()` re-scans. |
-| `ps5.attach(cb)` | — | `void cb()` fires on every input packet (~250 Hz). |
-| `ps5.attachOnConnect(cb)` | — | Fires once when the link comes up. |
-| `ps5.attachOnDisconnect(cb)` | — | Fires once when the link drops. |
-| `ps5.scanDevices(secs, cb)` | `bool` | Manual inquiry; `cb(mac, name, rssi)` per device. |
-
-> **Inputs are plain fields** — refreshed automatically every packet. Just read them like variables, no parentheses.
+| `ps5.begin(timeoutSecs)` | `bool` | Bring up the BT stack, scan up to `timeoutSecs`, auto-connect to the first DualSense seen. Returns `true` once stack is up; the actual connection is async — poll `isConnected()`. |
+| `ps5.begin("AA:BB:..")` | `bool` | Connect to a known MAC. Blocks up to 10 s for the first input packet. |
+| `ps5.isConnected()` | `bool` | True while input packets are flowing. Doubles as the auto-reconnect heartbeat. |
+| `ps5.forget()` | — | Drop the latched controller MAC so the next `begin()` re-scans from scratch. |
+| `ps5.scanDevices(secs, cb)` | `bool` | Manual BT inquiry; `cb(mac, name, rssi)` per unique device. Does NOT auto-connect — use `begin()` for that. |
 
 ### Sticks & triggers
 
 | Field | Type | Range | Notes |
 |---|---|---|---|
-| `ps5.lx` `ps5.ly` | `int8` | `-128 … +127` | Left stick. **Y is inverted** (up = negative). 0 = centered. |
+| `ps5.lx` `ps5.ly` | `int8` | `-128 … +127` | Left stick. **Y is inverted** (push UP = negative). 0 = centered. |
 | `ps5.rx` `ps5.ry` | `int8` | `-128 … +127` | Right stick, same convention. |
-| `ps5.l2` `ps5.r2` | `uint8` | `0 … 255` | Analog trigger. Doubles as "pressed" if `> 0`. |
+| `ps5.l2` `ps5.r2` | `uint8` | `0 … 255` | Analog triggers. Doubles as "pressed" if `> 0`. |
 
-Don't want to deal with raw `-128..+127` / `0..255`? Use the percent helpers:
+Prefer percent units? Use the helpers:
 
 | Helper | Range |
 |---|---|
-| `ps5.lxPct()` `ps5.lyPct()` `ps5.rxPct()` `ps5.ryPct()` | `-100 … +100` |
-| `ps5.l2Pct()` `ps5.r2Pct()` | `0 … 100` |
+| `ps5.lxPct() lyPct() rxPct() ryPct()` | `-100 … +100` |
+| `ps5.l2Pct() r2Pct()` | `0 … 100` |
 
 ### Buttons
 
@@ -129,19 +133,30 @@ All booleans. `true` while held.
 | **Stick clicks** | `ps5.l3`  `ps5.r3` |
 | **System** | `ps5.share`  `ps5.options`  `ps5.ps_btn`  `ps5.touchpad`  `ps5.mute` |
 
-> **Edge detection.** Use `ps5.pressed(ps5.square)` for a one-shot rising edge (fires once when `false → true`) and `ps5.released(ps5.square)` for the falling edge. Works on any button bool, e.g. `if (ps5.pressed(ps5.l1)) { ... }`. The library tracks previous state internally — no shadow variables in your sketch.
+Diagonals come naturally from logical AND, e.g. `ps5.up && ps5.right` for NE.
+
+### Edge detection
+
+For **one-shot** events instead of "true while held", wrap any bool in `pressed()` / `released()`:
+
+```cpp
+if (ps5.pressed(ps5.square))  Serial.println("square clicked");
+if (ps5.released(ps5.l1))     Serial.println("L1 let go");
+```
+
+The library tracks previous state internally for up to 24 fields — no `wasX` shadow flags in your sketch.
 
 ### Motion sensors
 
 | Field | Type | Conversion |
 |---|---|---|
-| `ps5.gyroX` `ps5.gyroY` `ps5.gyroZ` | `int16` raw | `÷ 1024` → deg/s |
-| `ps5.accelX` `ps5.accelY` `ps5.accelZ` | `int16` raw | `÷ 8192` → g (**includes gravity**) |
+| `ps5.gyroX gyroY gyroZ` | `int16` raw | `÷ 1024` → deg/s |
+| `ps5.accelX accelY accelZ` | `int16` raw | `÷ 8192` → g (**includes gravity**) |
 | `ps5.sensorTime` | `uint32` | `× 0.33 µs` per LSB |
 
 ### Touchpad
 
-The touchpad surface is **1920 × 1080**. Two simultaneous fingers, indexed `0` or `1`.
+Surface is **1920 × 1080**. Two simultaneous fingers, indexed `0` or `1`.
 
 | Method | Returns |
 |---|---|
@@ -162,34 +177,34 @@ The touchpad surface is **1920 × 1080**. Two simultaneous fingers, indexed `0` 
 
 ### Outputs (chainable)
 
-Each setter returns `*this`, so you can chain everything into one statement and finish with `.send()`.
+Each setter returns `*this`. Stage everything you want, then push it all in one frame with `.send()`:
 
 ```cpp
-ps5.lightbar(255, 0, 0)         // RGB lightbar around touchpad, 0..255 each
-   .rumble(255, 0)              // small (sharp buzz), large (deep rumble), 0..255
-   .playerLed(3, 3)             // turn on LED 3 at brightness 3 (1=dim, 2=mid, 3+=bright). 0 = off
-   .muteLed(2)                  // 0 = off, 1 = solid, 2 = pulse
-   .l2Trigger(20, 80, 100)      // see Adaptive triggers below
+ps5.lightbar(255, 0, 0)     // RGB lightbar (touchpad strip), 0..255 each
+   .rumble(255, 0)          // small (sharp buzz), large (deep rumble), 0..255
+   .playerLed(3, 3)         // player LED #3 at brightness 3 (1=dim, 2=mid, 3+=bright). 0=off
+   .muteLed(2)              // 0=off, 1=solid, 2=pulse
+   .l2Trigger(20, 80, 100)  // see Adaptive triggers
    .send();
 ```
 
 | Method | Effect |
 |---|---|
-| `.lightbar(r, g, b)` | RGB lightbar (the colored strip around the touchpad) |
-| `.rumble(small, large)` | small = sharp buzz, large = deep rumble |
-| `.playerLed(index, value)` | Light one of the 5 white LEDs below the touchpad. `index` 1..5 (1 = far-left). `value`: `0` = off, `1` = dim, `2` = mid, `3` (or any ≥3) = bright. Chain freely: `ps5.playerLed(1,3).playerLed(3,3).playerLed(5,3).send();`. **Note:** the controller has only one global brightness register, so the *last non-zero `value`* before `send()` sets brightness for every lit LED. Pass `value=0` to turn a LED off without changing the others' brightness. For a raw 5-bit mask: `ps5.output.playerLeds = 0b10101; ps5.send();` |
-| `.muteLed(mode)` | 0 = off, 1 = solid, 2 = pulse |
-| `.send()` | Push everything to the controller (call at most once per 10 ms) |
+| `.lightbar(r, g, b)` | RGB lightbar |
+| `.rumble(small, large)` | small = high-freq motor (right grip), large = low-freq motor (left grip) |
+| `.playerLed(index, value)` | LED #1..5 (1 = far-left). `value`: 0=off, 1=dim, 2=mid, 3+=bright. **One global brightness register**, so the *last non-zero `value` before `send()`* sets brightness for every lit LED. |
+| `.muteLed(mode)` | 0=off, 1=solid, 2=pulse |
+| `.send()` | Push the staged frame. **Don't call faster than every ~10 ms** or the L2CAP TX queue congests. |
+
+For a raw 5-bit player-LED mask: `ps5.output.playerLeds = 0b10101; ps5.send();`
 
 ### Adaptive triggers
 
-The DualSense triggers have little motors inside. Each trigger (L2 / R2) plays **one** effect at a time. L2 and R2 are independent — you can run different effects on each.
-
-All position / strength values are **percent (0..100)**. `freqHz` is real Hz (try 5..30).
+Each trigger (L2 / R2) plays **one** effect at a time. L2 and R2 are independent — you can mix different effects on each. All position / strength values are **percent (0..100)**. `freqHz` is real Hz (try 5–30).
 
 ```cpp
-ps5.l2Trigger(20, 80, 100)      // gun-trigger squeeze + click on left
-   .r2Pulse(30, 100, 15)        // buzzing right trigger
+ps5.l2Trigger(20, 80, 100)   // gun-trigger squeeze + click on left
+   .r2Pulse(30, 100, 15)     // buzzing right trigger
    .send();
 ```
 
@@ -212,20 +227,23 @@ ps5.l2Trigger(20, 80, 100)      // gun-trigger squeeze + click on left
 
 `r2*` versions are identical for the right trigger.
 
-> Want two basic effects on the **same** trigger (e.g. "trigger + pulse")? You can't — only one mode block per trigger. Use `l2Machine` (buzz inside a range) for the closest equivalent, or run different effects on L2 vs R2.
+> Want two basic effects on the **same** trigger (e.g. trigger + pulse)? You can't — only one mode block per trigger per frame. Use `l2Machine` (buzz inside a range) for the closest equivalent, or run different effects on L2 vs R2.
 
 ---
 
 ## Things to watch for
 
 ### Hardware quirks
-- **Accelerometer always reads ~1 g at rest.** It measures *proper acceleration* — gravity is part of it. Lay flat → one axis ≈ ±8192, others ≈ 0. Tilt → that 1 g redistributes. `√(x² + y² + z²) ≈ 8192` whenever the controller is still. To detect motion, threshold `|magnitude − 8192|`.
-- **Gyro at rest jitters ±20 LSB** ≈ ±0.02 deg/s. That's sensor noise around per-unit bias. To track orientation, integrate with bias subtracted using `sensorTime`; to detect motion, threshold the magnitude.
+
+- **Accelerometer reads ~1 g at rest.** It measures *proper acceleration* — gravity is part of it. Lay flat → one axis ≈ ±8192, others ≈ 0. `√(x² + y² + z²) ≈ 8192` whenever still. To detect motion, threshold `|magnitude − 8192|`.
+- **Gyro at rest jitters ±20 LSB** ≈ ±0.02 deg/s. Sensor noise around per-unit bias. Integrate with bias subtracted (using `sensorTime`) to track orientation; threshold the magnitude to detect motion.
 
 ### Sketch tips
-- **Don't block in `loop()`.** All radio work runs on FreeRTOS tasks — use `delay()` or `vTaskDelay()`, never a busy-loop.
-- **Reconnect is automatic.** No code needed. `attachOnDisconnect` fires when the link drops.
-- **Use the Huge APP partition.** With the default 1.2 MB partition, Bluedroid won't fit and the sketch won't even link.
+
+- **Don't block in `loop()`.** All radio work runs on FreeRTOS tasks. Use `delay()` / `vTaskDelay()`, not busy-loops.
+- **Reconnect is automatic** — `isConnected()` does it for you. Just call it every loop and skip work when it returns `false`.
+- **Use the Huge APP partition.** Bluedroid won't fit in the default 1.2 MB partition.
+- **Don't `send()` faster than ~10 ms apart**, or the L2CAP TX queue congests.
 
 ---
 
@@ -233,13 +251,13 @@ ps5.l2Trigger(20, 80, 100)      // gun-trigger squeeze + click on left
 
 The DualSense talks **HID over L2CAP** on two PSMs: **0x11 (control)** + **0x13 (interrupt)**. The library:
 
-1. After connect, sends a feature-set on PSM 0x11 to flip the controller out of "USB-style minimal report" into the full BT report. *Without this you'd only get sticks + face buttons.*
+1. After both channels are configured, sends a feature-set on PSM 0x11 to flip the controller out of "USB-style minimal report" into the full BT 0x31 report. *Without this you'd only get sticks + face buttons.*
 2. Reads input report **`0x31`** (78 bytes) on PSM 0x13.
 3. Writes output report **`0x31`** (79 bytes incl. 0xA2 HID header + CRC32) on PSM 0x13.
 
 ### Input report — 78 bytes
 
-Byte-for-byte aligned with Linux kernel `drivers/hid/hid-playstation.c` `struct dualsense_input_report`.
+Byte-for-byte aligned with Linux kernel `drivers/hid/hid-playstation.c`.
 
 | Byte | Field |
 |---:|---|
@@ -249,47 +267,37 @@ Byte-for-byte aligned with Linux kernel `drivers/hid/hid-playstation.c` `struct 
 | 4 / 5 | RX / RY (right stick) |
 | 6 / 7 | L2 / R2 trigger pressure 0..255 |
 | 8 | seq number |
-| 9 | buttons[0]: bits 0..3 = D-pad hat; bit 4 = □; bit 5 = ✕; bit 6 = ◯; bit 7 = △ |
-| 10 | buttons[1]: L1, R1, L2, R2, Share/Create, Options, L3, R3 |
-| 11 | buttons[2]: bit 0 = PS, bit 1 = Touchpad, bit 2 = Mic-Mute |
-| 12 | reserved |
-| 13..16 | reserved |
-| 17..22 | gyroscope x, y, z (le16, raw int16, `÷ 1024` = deg/s) |
-| 23..28 | accelerometer x, y, z (le16, raw int16, `÷ 8192` = g) |
+| 9 | low nibble = D-pad hat, high nibble = ◯ △ ✕ □ |
+| 10 | L1, R1, L2, R2, Create, Options, L3, R3 |
+| 11 | bit 0 = PS, bit 1 = Touchpad, bit 2 = Mic-Mute |
+| 17..22 | gyro x, y, z (le16, ÷ 1024 → deg/s) |
+| 23..28 | accel x, y, z (le16, ÷ 8192 → g) |
 | 29..32 | sensor timestamp (le32, 0.33 µs / LSB) |
-| 33 | reserved |
-| 34..41 | touchpad: 2 contacts × 4 bytes — `[id+active, x_lo, x_hi+y_lo, y_hi]` |
-| 42..53 | reserved |
-| 54 | status[0]: low nibble = battery 0..10; high nibble = charging state |
-| 55 | status[1]: HP detect, Mic detect, Mic-mute |
-| 56 | status[2] reserved |
-| 57..73 | reserved |
-| 74..77 | CRC32 LE of bytes 0..73 |
+| 34..41 | touchpad: 2 contacts × 4 bytes |
+| 54 | low nibble = battery 0..10, high nibble = charging state |
+| 55 | HP detect, mic detect, mic-mute |
+| 74..77 | CRC32 LE (not currently verified on input) |
 
 ### Output report — 79 bytes
 
 | Byte | Field |
 |---:|---|
-| 0 | `0xA2` — HID transaction header (DATA \| OUTPUT), part of CRC |
+| 0 | `0xA2` HID DATA \| OUTPUT header (covered by CRC) |
 | 1 | report id `0x31` |
-| 2 | seq_tag — high nibble = sequence 0..15, low nibble = 0 |
-| 3 | tag = `0x10` (controller drops the report if missing) |
-| 4 | valid_flag0 — bit 0 = COMPATIBLE_VIBRATION, bit 1 = HAPTICS_SELECT |
-| 5 | valid_flag1 — bit 0 = MIC_MUTE_LED, bit 2 = LIGHTBAR_ENABLE, bit 4 = PLAYER_INDICATOR |
-| 6 | motor_right (small/high-freq rumble) |
-| 7 | motor_left  (large/low-freq  rumble) |
-| 8..11 | audio (HP vol, speaker vol, mic vol, audio_control) — unused |
-| 12 | mute_button_led (0=off, 1=solid, 2=pulse) |
-| 13..40 | audio reserved |
-| 41 | audio_control2 |
-| 42 | valid_flag2 — bit 1 = LIGHTBAR_SETUP, bit 2 = COMPATIBLE_VIBRATION2 |
-| 43..44 | reserved |
-| 45 | lightbar_setup — bit 1 = LIGHT_OUT (cancels startup blue fade) |
-| 46 | player LED brightness 0..2 |
-| 47 | player_leds bitmask (bit 0 = far-left … bit 4 = far-right) |
+| 2 | seq tag (high nibble = sequence 0..15) |
+| 3 | tag `0x10` (DualSense BT marker — required) |
+| 4 | valid_flag0 — vibration + haptics + L2/R2 adaptive enables |
+| 5 | valid_flag1 — mic-mute LED, lightbar, player LED enables |
+| 6 / 7 | motor_right / motor_left rumble |
+| 12 | mute LED (0=off, 1=solid, 2=pulse) |
+| 14..24 | R2 adaptive trigger (1 mode byte + 10 params) |
+| 25..35 | L2 adaptive trigger (1 mode byte + 10 params) |
+| 42 | valid_flag2 — brightness + lightbar setup enables |
+| 45 | lightbar setup byte (0x02 disables startup blue fade) |
+| 46 | player LED brightness (0=bright, 1=mid, 2=dim) |
+| 47 | player LED bitmask (bit 0 = far-left … bit 4 = far-right) |
 | 48..50 | lightbar R, G, B |
-| 51..74 | reserved (zero) |
-| 75..78 | CRC32 LE of bytes 0..74 (poly `0xEDB88320`, init `0xFFFFFFFF`, xorout `0xFFFFFFFF`) |
+| 75..78 | CRC32 LE of bytes 0..74 (poly `0xEDB88320`, init/xorout `0xFFFFFFFF`) |
 
 ---
 
@@ -298,11 +306,11 @@ Byte-for-byte aligned with Linux kernel `drivers/hid/hid-playstation.c` `struct 
 ```
 src/
   ps5Controller.h        public Arduino API
-  ps5Controller.cpp      Arduino class, GAP setup, auto-pair, auto-reconnect
-  ps5_bytes.cpp          protocol parser + builder (the byte spec)
+  ps5Controller.cpp      Arduino class + GAP/SPP setup + auto-pair + auto-reconnect
+  ps5_bytes.cpp          protocol parser (input) + builder (output)
   bluedroid/
     bluedroid.h          minimal hand-curated L2CAP / BTM / OSI headers
-    bluedroid.cpp        L2CAP transport + GAP/SPP bring-up (stack glue)
+    bluedroid.cpp        L2CAP transport glue
 examples/testEverything/   full-feature sketch + 1 Hz serial snapshot
 ```
 
