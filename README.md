@@ -65,7 +65,7 @@ void loop() {
 
 1. Clone or download into `~/Documents/Arduino/libraries/esp-ps5`.
 2. *Tools → Board → ESP32 Arduino → ESP32 Dev Module*.
-3. *Tools → Partition Scheme → **Huge APP*** ← **mandatory.**
+3. *Tools → Partition Scheme → **Huge APP*** ← **preffered**
 4. *File → Examples → esp-ps5 → testEverything*.
 
 ---
@@ -238,7 +238,6 @@ ps5.l2Trigger(20, 80, 100)   // gun-trigger squeeze + click on left
 
 - **Don't block in `loop()`.** All radio work runs on FreeRTOS tasks. Use `delay()` / `vTaskDelay()`, not busy-loops.
 - **Reconnect is automatic** — `isConnected()` does it for you. Just call it every loop and skip work when it returns `false`.
-- **Use the Huge APP partition.** Bluedroid won't fit in the default 1.2 MB partition.
 - **Don't `send()` faster than ~10 ms apart**, or the L2CAP TX queue congests.
 
 ---
