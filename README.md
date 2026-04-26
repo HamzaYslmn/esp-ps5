@@ -70,10 +70,6 @@ void loop() {
 
 ---
 
-## Pair the controller
-
-**First time only:** flash the ESP32's Bluetooth MAC into the controller using [`sixaxispairer`](https://github.com/user-none/sixaxispairer) (or any equivalent tool) over USB. After that, the DualSense will accept connections from this ESP32 forever.
-
 **Every boot:**
 
 1. Hold **PS + Create** for ~3 s — the lightbar pulses white (controller is now advertising).
