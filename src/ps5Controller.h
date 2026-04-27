@@ -39,19 +39,28 @@ class ps5Controller {
   inline uint8_t l2Pct() const { return (uint8_t)((int)l2 * 100 / 255); }
   inline uint8_t r2Pct() const { return (uint8_t)((int)r2 * 100 / 255); }
 
-  /* Buttons: true while held. */
-  bool     l1 = false, r1 = false, l3 = false, r3 = false;          /* shoulders + stick clicks */
-  bool     up = false, down = false, left = false, right = false;   /* D-pad */
-  bool     cross = false, circle = false, square = false, triangle = false;
-  bool     share = false, options = false, ps_btn = false, touchpad = false, mute = false;
+  /* Buttons. Each one is a tiny struct that:
+   *   - Acts like a bool          : `if (ps5.square) ...`           true while held.
+   *   - Has `.pressed`  edge flag : `if (ps5.square.pressed)  ...`  fires ONCE per press.
+   *   - Has `.released` edge flag : `if (ps5.square.released) ...`  fires ONCE per release.
+   * Edge flags are LATCHED until you read them, so you never miss an event no
+   * matter how slow your loop runs. */
+  struct EdgeFlag {
+    mutable bool v = false;
+    /* read = consume: returns the flag and clears it in one shot. */
+    operator bool() const { bool r = v; v = false; return r; }
+  };
+  struct Button {
+    bool     cur = false;
+    EdgeFlag pressed;
+    EdgeFlag released;
+    operator bool() const { return cur; }   /* `if (ps5.square)` still works */
+  };
 
-  /* Edge detection: returns true ONCE the moment a bool flips false->true.
-   * Works on any bool member of this class. Examples:
-   *   if (ps5.pressed (ps5.square))  { ... }   // single-shot rising edge
-   *   if (ps5.released(ps5.square))  { ... }   // single-shot falling edge
-   * Internally the library tracks each field's previous value by address. */
-  bool pressed (const bool& field);
-  bool released(const bool& field);
+  Button   l1, r1, l3, r3;                  /* shoulders + stick clicks */
+  Button   up, down, left, right;           /* D-pad */
+  Button   cross, circle, square, triangle;
+  Button   share, options, ps_btn, touchpad, mute;
 
   /* Motion sensors (raw). gyro / 1024 = deg/sec.  accel / 8192 = g.
    * Marked volatile because parsePacket() writes from the Bluedroid task while
@@ -67,9 +76,22 @@ class ps5Controller {
   /* Status. battery: 0..100 (percent). */
   uint8_t  battery = 0;
   bool     charging = false, fullyCharged = false, headphones = false, micJack = false;
+  /* True when the controller's charging logic reports a fault (over-/under-
+   * voltage, temperature out of range, charge fault). Combine with `charging`:
+   * if both false -> discharging on battery; if `chargingError` true the
+   * controller will NOT charge until the user unplugs/cools/replugs. */
+  bool     chargingError = false;
+  /* True when the user has pressed the mute button on the controller and the
+   * controller's firmware has marked the mic as muted (persists until the
+   * user taps it again). Independent of `output.micMute` (which we send to
+   * the controller); they may briefly disagree until the next packet round-trip. */
+  bool     micMuted = false;
 
-  /* Raw last-packet bytes (78 B). For debug only. Valid only just after a packet. */
-  const uint8_t* latestPacket = nullptr;
+  /* Raw last input packet (78 B). Pointer to the wire buffer; valid only just
+   * after a packet arrives. Useful when reverse-engineering new fields
+   * (mic / speaker / future firmware bytes). volatile because parsePacket
+   * (Bluedroid task) writes the pointer while loop() reads it. */
+  const uint8_t* volatile latestPacket = nullptr;
 
   /* Touchpad: 2 fingers max. Surface is 1920 x 1080. x/y are volatile for the
    * same cross-task reason as the motion fields above. */
@@ -92,6 +114,8 @@ class ps5Controller {
     uint8_t playerLeds = 0;                     /* 5-bit mask, bit 0 = far-left LED */
     uint8_t ledBrightness = 1;                  /* wire value, 0=bright,1=mid,2=dim. Set indirectly via playerLed(). */
     uint8_t muteLed = 0;                        /* 0=off, 1=on, 2=pulse */
+    bool    micMute = true;                     /* default ON: mic hardware OFF + power-save bit set. Call micMute(false) to capture audio (needs A2DP/HFP — not currently wired). */
+    bool    releaseLeds = false;                /* one-shot: hand lightbar/player-LED control back to firmware on next send(); auto-cleared. */
     uint8_t leftTriggerMode = 0,  leftTriggerParam[10] = {0};   /* set via l2*() helpers */
     uint8_t rightTriggerMode = 0, rightTriggerParam[10] = {0};  /* set via r2*() helpers */
   } output;
@@ -134,6 +158,14 @@ class ps5Controller {
 
   /* Mic-mute LED.  0 = off,  1 = on,  2 = pulse. */
   ps5Controller& muteLed      (uint8_t mode);
+
+  /* Electrically mute / un-mute the microphone hardware (separate from the
+   * LED above — this gates the actual audio capture). */
+  ps5Controller& micMute      (bool on);
+
+  /* One-shot: tell the controller to take its lightbar / player-LED state
+   * back into firmware control (default boot behaviour). Cleared after send(). */
+  ps5Controller& releaseLeds  ();
 
   /* Send everything you set above. Call at most once per 10 ms. */
   ps5Controller& send();
@@ -184,13 +216,6 @@ class ps5Controller {
 
  private:
   callback_t _onPacket = nullptr, _onConnect = nullptr, _onDisconnect = nullptr;
-
-  /* Per-field previous-state tracker for pressed()/released(). 24 slots covers
-   * the 17 button bools plus typical user-added bools; on overflow the oldest
-   * entry is recycled. Lookup is by address of the bool field. */
-  struct EdgeSlot { const bool* p; bool prev; };
-  EdgeSlot _edges[24] = {};
-  bool*    _edgePrev(const bool& field);   /* returns ptr into _edges entry, allocating if new */
 };
 
 #ifndef NO_GLOBAL_INSTANCES
@@ -220,7 +245,6 @@ void ps5Enable(void);                    /* SET_FEATURE 0xF4 handshake on contro
 void ps5ConnectEvent(uint8_t isConnected);   /* called by L2CAP on link up/down */
 
 /* bluedroid/bluedroid.cpp */
-void  sppInit(void);
 void  ps5_l2cap_init_services(void);
 long  ps5_l2cap_connect(uint8_t addr[6]);
 long  ps5_l2cap_reconnect(void);

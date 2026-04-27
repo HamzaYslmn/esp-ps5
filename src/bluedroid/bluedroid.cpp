@@ -1,4 +1,4 @@
-/* bluedroid.cpp - Bluedroid transport glue (L2CAP HID + GAP/SPP bring-up).
+/* bluedroid.cpp - Bluedroid transport glue (L2CAP HID + GAP bring-up).
  *
  * This file is intentionally NOT about the DualSense protocol. Everything
  * here is generic Bluedroid plumbing: opening L2CAP listeners on the two
@@ -17,7 +17,8 @@
  * The two functional groups in this file:
  *   1. L2CAP transport - register HIDC/HIDI PSMs, run the connect/config
  *      handshake, send/receive HID frames.
- *   2. GAP/SPP bring-up - device-name + connectable scan mode.
+ *   2. GAP bring-up - device-name + connectable scan mode (handled by the
+ *      Arduino-side ensureServices(); no SPP profile needed for L2CAP HID).
  *
  * The handful of C-linkage entry points used by ps5Controller.cpp are
  * declared in ../ps5Controller.h's extern "C" block.
@@ -30,7 +31,7 @@
 #include <esp_bt_defs.h>
 #include <esp_bt_main.h>
 #include <esp_gap_bt_api.h>
-#include <esp_spp_api.h>
+#include <esp_bt_main.h>
 #include <esp_log.h>
 
 #define ps5_TAG "ps5"
@@ -71,7 +72,7 @@ static const tL2CAP_APPL_INFO dyn_info = {
 };
 
 static tL2CAP_CFG_INFO ps5_cfg_info;
-static bool       is_connected            = false;
+static volatile bool is_connected            = false;
 static BD_ADDR    g_bd_addr               = {0};
 static uint16_t   l2cap_control_channel   = 0;
 static uint16_t   l2cap_interrupt_channel = 0;
@@ -216,27 +217,6 @@ static void ps5_l2cap_data_ind_cback(uint16_t cid, BT_HDR* p_buf) {
 
 static void ps5_l2cap_congest_cback(uint16_t cid, bool congested) {
     ESP_LOGI(ps5_TAG, "congest cid=0x%02x %d", cid, congested);
-}
-
-/* ============================================================================
- * MARK: GAP/SPP - device-name + connectable scan-mode bring-up.
- * ==========================================================================*/
-
-static void sppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
-    (void)param;
-    if (event == ESP_SPP_INIT_EVT) {
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-    }
-}
-
-void sppInit(void) {
-    esp_err_t ret;
-    if ((ret = esp_spp_register_callback(sppCallback)) != ESP_OK) {
-        ESP_LOGE(ps5_TAG, "spp register failed: %s", esp_err_to_name(ret)); return;
-    }
-    if ((ret = esp_spp_init(ESP_SPP_MODE_CB)) != ESP_OK) {
-        ESP_LOGE(ps5_TAG, "spp init failed: %s", esp_err_to_name(ret)); return;
-    }
 }
 
 } /* extern "C" */

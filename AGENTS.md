@@ -371,3 +371,115 @@ connect fires. `ps5.forget()` clears the in-RAM target so the next
   just runs a fresh inquiry that early-exits on the first DualSense match
   (~1–3 s typical). Saves ~50 lines + the `nvs_flash` dependency.
   `ps5.forget()` simplified to just clearing bluedroid's in-RAM target.
+
+## Fixed (2026-05-02)
+
+- **Chained edge API (`ps5.square.pressed` / `ps5.square.released`)**: every
+  button is now a tiny `Button { bool cur; EdgeFlag pressed; EdgeFlag
+  released; }` with `operator bool()` returning `cur`, so `if (ps5.square)`
+  still works. `EdgeFlag::operator bool() const` is consume-on-read (sets
+  itself false), so edges stay LATCHED until consumed — slow loops never
+  miss a press. `parsePacket` updates each button via a local `setBtn(b, v)`
+  lambda that sets `pressed.v=true` on rising edge and `released.v=true` on
+  falling edge. Replaces the old `ps5.pressed(field)` / `ps5.released(field)`
+  methods + the 24-slot `EdgeSlot _edges[24]` LRU table (~200 B RAM saved,
+  zero address-keyed lookup overhead per call). Net win: cleaner API, less
+  RAM, no missed edges.
+
+## Fixed (2026-05-03)
+
+- **Cross-task volatiles**: `g_active` (in `ps5Controller.cpp`) and `is_connected`
+  (in `bluedroid.cpp`) are written from the Bluedroid task and read from the
+  Arduino loop() task. They were plain `bool`, so the compiler was free to
+  cache stale values in a register across the read inside `send()` /
+  `isConnected()` — meaning the loop could keep skipping `send()` for many
+  iterations after the controller had already gone live, or vice versa. Both
+  are now `volatile bool`. Two-line fix, closes a latent race.
+- **Removed `latestPacket`**: ~~the public `const uint8_t* latestPacket`
+  pointer~~ — **REVERTED**: kept after all (now `const uint8_t* volatile`)
+  because future protocol work (mic / speaker / new firmware bytes) needs
+  raw access for reverse-engineering. Volatile guards against torn pointer
+  reads from the loop() task.
+- **Dropped SPP profile init**: `sppInit()` registered an SPP callback whose
+  *only* job was to run `esp_bt_gap_set_scan_mode(CONNECTABLE,
+  NON_DISCOVERABLE)` from inside `ESP_SPP_INIT_EVT`. SPP is not required for
+  L2CAP HID — replaced with a direct `esp_bt_gap_set_scan_mode()` call in
+  `ensureServices()`. Removes `sppCallback`, `sppInit`, and the
+  `<esp_spp_api.h>` include (~25 lines).
+- **Adaptive trigger DRY**: the seven mode builders (`buildOff` /
+  `buildFeedback` / `buildWeapon` / `buildVibration` / `buildBow` /
+  `buildGalloping` / `buildMachine`) repeated the same patterns: memset+mode
+  set, two-zone bitmask packing, and tail-mask + 3-bit force packing.
+  Extracted three shared helpers — `setOff()`, `writeMask()`, `packTail()`,
+  plus `pairMaskStrict()` (Weapon/Machine: a in [lo..hi-1]) and
+  `pairMaskLoose()` (Bow/Galloping: a in [lo..hi], allows degenerate
+  collapse). The clamp split intentionally preserves byte-for-byte wire
+  parity with the previous code, including the pre-existing 1-bit-mask
+  edge case for Bow/Galloping at start=100%. Net: ~−45 LOC, identical
+  wire output.
+- **`isConnected()` also rescans when no target MAC**: previously the 5 s
+  retry inside `isConnected()` only fired `ps5_l2cap_reconnect()` (outbound
+  CONNECT_REQ to a known MAC). If `begin()`'s initial scan didn't see a
+  controller (pad off, out of range, just paired), the loop would never
+  re-scan and the only way to recover was to call `begin()` again. Now
+  `isConnected()` checks `ps5_l2cap_has_target()` and runs `autoPair(4)`
+  when no MAC is latched, so the sketch can sit in `if (!ps5.isConnected())
+  return;` and recover from cold-start no-pad situations on its own. Single
+  task — the retry still runs on the existing user-loop call, no
+  `xTaskCreate` overhead.
+- **Future-work protocol map**: added a "UNUSED / FUTURE-WORK BITS" section
+  to `ps5_bytes.cpp` documenting every protocol feature we don't currently
+  use, cross-checked against `drivers/hid/hid-playstation.c` (Linux master,
+  2026). Covers: audio (mic capture + speaker volume + output path + preamp
+  gain) — protocol-supported but needs a separate BT audio profile
+  (HFP/A2DP) which Linux itself doesn't ship for DualSense; real mic mute
+  via power-save register; vibration v2 (firmware >= 2.21); RELEASE_LEDS;
+  charging error nibbles (0xA/0xB/0xF); persisted mic-mute status bit;
+  mute LED pulse mode; feature reports 0x05 (motion calibration), 0x09
+  (pairing info), 0x20 (firmware version); reserved input bytes (12,
+  13..16, 33, 42..53, 56, 57..73) — inspect via `ps5.latestPacket` if new
+  firmware ever lights any of them up.
+
+## Fixed (2026-05-04)
+
+- **Power-save mic mute**: new `ps5.micMute(bool)` fluent setter, plus
+  `ps5.output.micMute` field. On `send()` we set `VF1 bit 1`
+  (POWER_SAVE_CONTROL_ENABLE) and `byte 13 bit 4`
+  (DS_OUTPUT_POWER_SAVE_CONTROL_MIC_MUTE) — this gates the actual mic
+  hardware (audio capture), independent of the existing `muteLed()` visual.
+  Linux kernel pairs these two together inside the mic-mute work handler.
+- **Release LEDs**: new one-shot `ps5.releaseLeds()` setter. Sets `VF1
+  bit 3` on the next frame and auto-clears the request bit, handing
+  lightbar + player-LED control back to the controller's firmware
+  (default boot animation returns until the sketch sets a colour again).
+- **Charging error nibble**: new `ps5.chargingError` input bool. True when
+  the charging nibble (input byte 54 bits 4..7) is `0xA` (voltage/temp out
+  of range), `0xB` (temperature error), or `0xF` (charge fault). The pad
+  will not accept charge until the user unplugs / cools / replugs.
+  `charging` and `fullyCharged` already exist for the normal nibbles.
+- **Persisted mic-mute status**: new `ps5.micMuted` input bool, set from
+  `DS_STATUS1_MIC_MUTE` (input byte 55 bit 2). Tracks the controller's
+  *firmware-persisted* mute state (toggled by the user tapping the mute
+  button), separate from `ps5.mute` which is the raw button edge.
+- **First-packet stall fix**: `isConnected()` now re-fires `ps5Enable()`
+  (the SET_FEATURE 0xF4/0x43/0x02 handshake) every 400 ms while the
+  L2CAP channels are up but no input report has arrived yet. The
+  DualSense occasionally drops the very first enable packet right after
+  channel setup, leaving the link in a permanent "channels up but
+  silent" stall. Cheap (4 bytes on the control PSM) and stops as soon
+  as the first packet flips `g_active`.
+- **Mic hardware default = OFF**: `Out::micMute` now defaults to `true`,
+  so on boot every send() carries the power-save bit (VF1 0x02 + byte 13
+  bit 4) and the mic is electrically muted. ESP32 controller projects
+  almost never need DualSense mic capture (BT audio profile isn't
+  wired anyway), and the saved current pays for itself instantly. Any
+  sketch that *does* want the mic live calls `ps5.micMute(false)`.
+- **Example sketch**: `testEverything.ino` MUTE button handler now
+  distinguishes short click (cycles `muteLed` 0→1→2 = off/solid/pulse)
+  from long press ≥600 ms (toggles real `micMute()` hw mute). SHARE
+  button is an on/off toggle that fires `releaseLeds()` and keeps
+  re-arming that bit every frame so the firmware retains lightbar +
+  player LEDs (second press flips back, sketch resumes writing them).
+  The 1 Hz snapshot prints `chargingError`, `micMuted`, and the new
+  `output.micMute` field. Removed the old "mute LED mirrors button"
+  one-liner that was stomping the user's pulse selection every frame.

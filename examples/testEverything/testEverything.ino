@@ -6,7 +6,9 @@
 // Mappings:
 //   LEFT  stick  -> lightbar (Wikipedia RGB wheel: up=red, BR=green, BL=blue)
 //   RIGHT stick  -> rumble (RX+ right motor, RX- left motor, |RY| both)
-//   Mute button  -> mute LED mirrors button state
+//   MUTE button  -> short click cycles mute LED (off / solid / pulse)
+//                   long press (>= 600 ms) toggles real mic hardware mute
+//   SHARE button -> on/off toggle: release LEDs to firmware, press again to take back
 //   Player LEDs  -> march left -> right every 600 ms
 //
 // The serial monitor prints a tidy 1 Hz snapshot of every control,
@@ -70,39 +72,64 @@ static void stickToRumble(int8_t rx, int8_t ry) {
   ps5.output.largeRumble = (uint8_t)lR;
 }
 
-// MARK: snapshot - one group per line, label-prefixed for easy reading.
+// SHARE-button on/off toggle for releaseLeds(). Defined here so snapshot()
+// (above) and handleLedsRelease() (below) can both see it.
+static bool ledsReleased = false;
+
+// MARK: snapshot - compact, list-friendly view for the Arduino IDE serial
+// monitor. Only "interesting" stuff is printed: pressed buttons are listed
+// by name, idle ones are skipped, motion/touch only show when active.
+static void appendBtn(String& s, bool on, const char* name) {
+  if (on) { if (s.length()) s += ' '; s += name; }
+}
+
 static void snapshot() {
-  Serial.println(F("------------------------------------------------"));
-  Serial.printf("LS:    x=%+4d y=%+4d  click=%d\n", ps5.lx, ps5.ly, ps5.l3);
-  Serial.printf("RS:    x=%+4d y=%+4d  click=%d\n", ps5.rx, ps5.ry, ps5.r3);
-  Serial.printf("TRIG:  L1=%d L2val=%3u   R1=%d R2val=%3u\n",
-                ps5.l1, ps5.l2, ps5.r1, ps5.r2);
-  Serial.printf("DPAD:  U=%d D=%d L=%d R=%d\n",
-                ps5.up, ps5.down, ps5.left, ps5.right);
-  Serial.printf("FACE:  Tri=%d Cir=%d Cro=%d Sq=%d\n",
-                ps5.triangle, ps5.circle, ps5.cross, ps5.square);
-  Serial.printf("META:  Share=%d Opt=%d PS=%d Touch=%d Mute=%d\n",
-                ps5.share, ps5.options, ps5.ps_btn, ps5.touchpad, ps5.mute);
-  Serial.printf("GYRO:  x=%+6d y=%+6d z=%+6d\n",
-                ps5.gyroX, ps5.gyroY, ps5.gyroZ);
-  Serial.printf("ACCEL: x=%+6d y=%+6d z=%+6d\n",
-                ps5.accelX, ps5.accelY, ps5.accelZ);
-  for (int i = 0; i < 2; i++) {
+  Serial.println();
+  Serial.printf("PS5  link=%s  bat=%u%% %s%s  hp=%d  mic=%d/%d\n",
+                ps5.isConnected() ? "UP" : "DOWN",
+                ps5.battery,
+                ps5.charging ? "CHG" : "BAT",
+                ps5.chargingError ? "!" : "",
+                ps5.headphones, ps5.micJack, ps5.micMuted);
+
+  Serial.printf("Sticks  L=(%+4d,%+4d) R=(%+4d,%+4d)   Triggers  L2=%3u R2=%3u\n",
+                ps5.lx, ps5.ly, ps5.rx, ps5.ry, ps5.l2, ps5.r2);
+
+  String btns;
+  appendBtn(btns, ps5.up,        "Up");
+  appendBtn(btns, ps5.down,      "Down");
+  appendBtn(btns, ps5.left,      "Left");
+  appendBtn(btns, ps5.right,     "Right");
+  appendBtn(btns, ps5.triangle,  "Tri");
+  appendBtn(btns, ps5.circle,    "Cir");
+  appendBtn(btns, ps5.cross,     "Cro");
+  appendBtn(btns, ps5.square,    "Sqr");
+  appendBtn(btns, ps5.l1,        "L1");
+  appendBtn(btns, ps5.r1,        "R1");
+  appendBtn(btns, ps5.l3,        "L3");
+  appendBtn(btns, ps5.r3,        "R3");
+  appendBtn(btns, ps5.share,     "Share");
+  appendBtn(btns, ps5.options,   "Options");
+  appendBtn(btns, ps5.ps_btn,    "PS");
+  appendBtn(btns, ps5.touchpad,  "Touchpad");
+  appendBtn(btns, ps5.mute,      "Mute");
+  Serial.printf("Pressed  %s\n", btns.length() ? btns.c_str() : "(none)");
+
+  for (int i = 0; i < 2; i++)
     if (ps5.TouchActive(i))
-      Serial.printf("TOUCH%d: x=%4u y=%4u id=%u\n",
+      Serial.printf("Touch%d   x=%u y=%u id=%u\n",
                     i, ps5.TouchX(i), ps5.TouchY(i), ps5.TouchId(i));
-    else
-      Serial.printf("TOUCH%d: idle\n", i);
-  }
-  Serial.printf("BAT:   %u%% %s  HP=%d MIC=%d\n",
-                ps5.battery, ps5.charging ? "CHG" : "DSCH",
-                ps5.headphones, ps5.micJack);
+
+  static const char* mlName[3] = { "off", "solid", "pulse" };
   uint8_t pm = ps5.output.playerLeds & 0x1F;
-  Serial.printf("OUT:   rgb=(%3u,%3u,%3u)  rumble=(%3u,%3u)  playerMask=0b%u%u%u%u%u  muteLED=%u\n",
+  Serial.printf("Output   lightbar=#%02X%02X%02X  rumble=%u/%u  player=%c%c%c%c%c  muteLED=%s  micHW=%s  release=%s\n",
                 ps5.output.r, ps5.output.g, ps5.output.b,
                 ps5.output.smallRumble, ps5.output.largeRumble,
-                (pm>>4)&1, (pm>>3)&1, (pm>>2)&1, (pm>>1)&1, pm&1,
-                ps5.output.muteLed);
+                (pm>>0)&1?'o':'.', (pm>>1)&1?'o':'.', (pm>>2)&1?'o':'.',
+                (pm>>3)&1?'o':'.', (pm>>4)&1?'o':'.',
+                mlName[ps5.output.muteLed > 2 ? 0 : ps5.output.muteLed],
+                ps5.output.micMute ? "on" : "off",
+                ledsReleased       ? "on" : "off");
 }
 
 // ============================================================================
@@ -112,13 +139,16 @@ static uint8_t  briApi = 3;                // 1=dim, 2=mid, 3=bright. Shared bet
 static int      lastConn = -1;
 static uint32_t tSend = 0, tReport = 0;
 
-// Edge detection is handled by the library: ps5.pressed(ps5.<button>).
+// Edge detection is built into each Button: ps5.<button>.pressed / .released.
 
 // MARK: handleConnection - log up/down transitions, return true if connected.
+// Library auto-drains all button edges on the first input packet, so the
+// sketch only needs to reset its own toggle state (ledsReleased).
 static bool handleConnection() {
   int conn = ps5.isConnected() ? 1 : 0;
   if (conn != lastConn) {
     Serial.printf("[STATUS] connection %s\n", conn ? "UP" : "DOWN");
+    if (conn) ledsReleased = false;
     lastConn = conn;
   }
   if (!conn) { vTaskDelay(pdMS_TO_TICKS(100)); return false; }
@@ -129,7 +159,7 @@ static bool handleConnection() {
 // (5 bits, one per LED). 0 = all off, 1 = only far-left, 31 = all five.
 // Re-applies via playerLed(idx, val) so the current brightness sticks.
 static void tickPlayerLed() {
-  if (!ps5.pressed(ps5.triangle)) return;
+  if (!ps5.triangle.pressed) return;
   uint8_t mask = (uint8_t)((ps5.output.playerLeds + 1) & 0x1F);
   for (uint8_t i = 1; i <= 5; i++) {
     bool on = (mask >> (i - 1)) & 1;
@@ -148,8 +178,8 @@ static void handleAdaptiveTriggers() {
   static const char* trigName[7] = { "Off", "Rigid", "Trigger", "Pulse", "Bow", "Galloping", "Machine" };
   static int8_t trigMode    = 0;
   bool          trigChanged = false;
-  if (ps5.pressed(ps5.r1)) { trigMode = (int8_t)((trigMode + 1) % 7);       trigChanged = true; }
-  if (ps5.pressed(ps5.l1)) { trigMode = (int8_t)((trigMode + 7 - 1) % 7);   trigChanged = true; }
+  if (ps5.r1.pressed) { trigMode = (int8_t)((trigMode + 1) % 7);       trigChanged = true; }
+  if (ps5.l1.pressed) { trigMode = (int8_t)((trigMode + 7 - 1) % 7);   trigChanged = true; }
   if (!trigChanged) return;
   switch (trigMode) {
     case 0: ps5.l2Off()                              .r2Off();                                break;
@@ -172,7 +202,7 @@ static void handleAdaptiveTriggers() {
 // MARK: handleBrightness - SQUARE cycles player-LED brightness BRIGHT -> MID -> DIM.
 // Re-applies the current LED mask with the new brightness via playerLed(idx, val).
 static void handleBrightness() {
-  if (!ps5.pressed(ps5.square)) return;
+  if (!ps5.square.pressed) return;
   briApi = (briApi == 3) ? 2 : (briApi == 2 ? 1 : 3);   // 3 -> 2 -> 1 -> 3
   uint8_t mask = ps5.output.playerLeds;
   for (uint8_t i = 1; i <= 5; i++) {
@@ -183,31 +213,74 @@ static void handleBrightness() {
   Serial.printf("[BRI ] %s\n", briName[briApi]);
 }
 
-// MARK: handleForget - OPTIONS wipes the saved MAC from NVS. Next boot will
-// re-scan instead of fast-reconnecting to this controller.
+// MARK: handleForget - OPTIONS clears the in-RAM target so the next
+// begin() rescans from scratch. (Bluedroid still keeps the link key in
+// its own NVS, so a paired pad stays paired across reboots regardless.)
 static void handleForget() {
-  if (!ps5.pressed(ps5.options)) return;
+  if (!ps5.options.pressed) return;
   ps5.forget();
-  Serial.println(F("[NVS ] saved MAC erased - next boot will re-scan"));
+  Serial.println(F("[FGT ] target cleared - next begin() will rescan"));
+}
+
+// MARK: handleMute - short click cycles mute LED off/solid/pulse,
+// long press (>= 600 ms) toggles the real mic hardware mute. The two
+// are independent on the wire: muteLed is just a visual, micMute()
+// gates the actual microphone capture via the power-save register.
+static void handleMute() {
+  static uint32_t pressedAt = 0;
+  if (ps5.mute.pressed)  pressedAt = millis();
+  if (!ps5.mute.released) return;
+  uint32_t held = millis() - pressedAt;
+  if (held >= 600) {
+    ps5.micMute(!ps5.output.micMute);
+    Serial.printf("[MUTE] hw mic = %s (held %lu ms)\n",
+                  ps5.output.micMute ? "MUTED" : "LIVE", (unsigned long)held);
+  } else {
+    static const char* mn[3] = { "OFF", "SOLID", "PULSE" };
+    uint8_t next = (uint8_t)((ps5.output.muteLed + 1) % 3);
+    ps5.muteLed(next);
+    Serial.printf("[MUTE] led = %s\n", mn[next]);
+  }
+}
+
+// MARK: handleLedsRelease - SHARE button is an on/off toggle: first press
+// hands lightbar + player LEDs back to firmware (boot animation returns);
+// second press lets the sketch take control again (next pushOutputs sets
+// lightbar from the L-stick and player LEDs from tickPlayerLed).
+// `ledsReleased` also gates pushOutputs so we don't immediately stomp the
+// firmware animation while the user wants to see it.
+static void handleLedsRelease() {
+  if (!ps5.share.pressed) return;
+  ledsReleased = !ledsReleased;
+  if (ledsReleased) {
+    ps5.releaseLeds().send();
+    Serial.println(F("[SHR ] LEDs -> firmware"));
+  } else {
+    Serial.println(F("[SHR ] LEDs -> sketch"));
+  }
 }
 
 // MARK: handleRawDump - TOUCHPAD click prints the latest 78-byte BT 0x31
-// input report as hex. Handy when debugging custom field decoding.
+// input report as hex. Handy when reverse-engineering new fields
+// (mic / speaker / future firmware bytes).
 static void handleRawDump() {
-  if (!ps5.pressed(ps5.touchpad) || !ps5.latestPacket) return;
+  if (!ps5.touchpad.pressed || !ps5.latestPacket) return;
   Serial.print(F("[RAW ] "));
   for (int i = 0; i < 78; i++) Serial.printf("%02x ", ps5.latestPacket[i]);
   Serial.println();
 }
 
-// MARK: pushOutputs - throttled (kSendMs) chained send: lightbar + rumble + mute.
-// Player LEDs are set elsewhere (tickPlayerLed / handleBrightness) and persist in ps5.output.
+// MARK: pushOutputs - throttled (kSendMs) chained send: lightbar + rumble.
+// muteLed / micMute are toggled by handleMute() and persist in ps5.output
+// between sends, so we don't re-write them here. Skipped while the user
+// has handed LEDs back to firmware via SHARE.
 static void pushOutputs(uint32_t now) {
   if (now - tSend < kSendMs) return;
   tSend = now;
+  if (ledsReleased) { ps5.releaseLeds().send(); return; }   // re-arm each frame so firmware keeps the LEDs
   stickToLightbar(ps5.lx, ps5.ly);
   stickToRumble  (ps5.rx, ps5.ry);
-  ps5.muteLed(ps5.mute ? 1 : 0).send();
+  ps5.send();
 }
 
 // MARK: pushReport - 1 Hz tidy serial dump of all input + output state.
@@ -224,6 +297,7 @@ void setup() {
   Serial.println(F("[BOOT] ps5.begin(20): tries saved MAC from NVS first, else scans up to 20s."));
   Serial.println(F("[BOOT] Controls:  L1/R1 = prev/next adaptive-trigger mode,  SQUARE = cycle player-LED brightness."));
   Serial.println(F("[BOOT]            TRIANGLE = step player-LED bitmask 0..31,  TOUCHPAD click = dump raw bytes,  OPTIONS = forget saved MAC."));
+  Serial.println(F("[BOOT]            MUTE click = cycle LED off/solid/pulse, MUTE long >=600ms = toggle hw mic mute.  SHARE = release LEDs on/off toggle."));
   ps5.begin(20);   // tries saved MAC -> scan -> pair (early-exit) + auto-reconnect
 }
 
@@ -235,6 +309,8 @@ void loop() {
   handleAdaptiveTriggers();
   handleBrightness();
   handleForget();
+  handleMute();
+  handleLedsRelease();
   handleRawDump();
   pushOutputs(now);
   pushReport(now);

@@ -136,6 +136,103 @@
  *
  * The wire 0xA2 prefix IS part of the CRC input -- it's the BT-HID transaction
  * byte the controller signs along with the rest of the payload.
+ *
+ * ----------------------------------------------------------------------------
+ * UNUSED / FUTURE-WORK BITS (verified vs Linux hid-playstation.c, 2026)
+ * ----------------------------------------------------------------------------
+ *
+ * Cross-checked against drivers/hid/hid-playstation.c in linux master
+ * (Sony Interactive Entertainment, GPL-2.0). All identifiers below match
+ * the kernel's DS_OUTPUT_VALID_FLAG* / DS_OUTPUT_* / DS_STATUS* names.
+ *
+ * == Audio (mic + speaker) - protocol-supported, transport-blocked ==
+ *
+ * The OUTPUT report already carries:
+ *   - byte  8: headphone_volume (0..0x7F)
+ *   - byte  9: speaker_volume   (0..0xFF, DualSense uses 0x3D..0x64)
+ *   - byte 10: mic_volume       (0..0x40)
+ *   - byte 11: audio_control - bits 4..5 = output path select:
+ *               0 = HP=L|R, SP=mute  (headphones plugged in)
+ *               1 = HP=L|L, SP=mute
+ *               2 = HP=L|L, SP=R
+ *               3 = HP=mute, SP=R    (no headphones, route to internal SP)
+ *   - byte 41: audio_control2 - bits 0..2 = SP preamp gain (0=+0dB, 1=+6dB,
+ *               2=+12dB; kernel uses +6 dB when only SP is active).
+ * Required valid_flag bits to make any of this take effect:
+ *   VF0 bit 5 = SPEAKER_VOLUME_ENABLE
+ *   VF0 bit 6 = MIC_VOLUME_ENABLE
+ *   VF0 bit 7 = AUDIO_CONTROL_ENABLE   (path select + mute toggles)
+ *   VF1 bit 7 = AUDIO_CONTROL2_ENABLE  (SP preamp gain)
+ *
+ * BUT: actually streaming audio (capturing from the mic, playing through
+ * the speaker) needs a separate Bluetooth audio profile - HFP/HSP for the
+ * mic, A2DP for the speaker. The Linux kernel explicitly notes
+ * "Bluetooth audio is currently not supported" for DualSense; on ESP32 it
+ * would mean enabling the BT classic audio stack alongside L2CAP HID
+ * (Bluedroid supports both, but co-existence is heavy on RAM/flash).
+ * Conclusion: volume / routing / mute *control* is a small future feature;
+ * actual mic capture is a much larger project.
+ *
+ * == Power save (real mic mute, not just the LED) ==
+ *
+ * VF1 bit 1 = POWER_SAVE_CONTROL_ENABLE; byte 13 bit 4 = MIC_MUTE in the
+ * power_save_control register. Setting these *electrically* mutes the mic
+ * hardware (Linux pairs this with the touch-mute-button toggle). Today our
+ * `muteLed()` only changes the orange LED above the mute button; it does
+ * not gate the mic itself. Tiny future addition.
+ *
+ * == Compatible vibration v2 ==
+ *
+ * VF2 bit 2 = COMPATIBLE_VIBRATION2. Firmware feature-version >= 2.21
+ * (DualSense Edge unconditionally) prefers the v2 rumble path over the v1
+ * COMPATIBLE_VIBRATION (VF0 bit 0) we currently use. v1 still works on
+ * new firmwares but Sony recommends v2. Reading the firmware version
+ * needs feature report 0x20 (DS_FEATURE_REPORT_FIRMWARE_INFO, 64 B).
+ *
+ * == Release LEDs ==
+ *
+ * VF1 bit 3 = RELEASE_LEDS - hands lightbar / player LED control back to
+ * the firmware (the controller reverts to its default boot animation).
+ * Useful if a sketch wants to "let go" of the LEDs without rebooting.
+ *
+ * == Status nibble extras (input byte 54 / 55) ==
+ *
+ * Charging nibble (status[0] bits 4..7) values we currently lump into
+ * `charging` / `fullyCharged`:
+ *   0x0 = discharging       0x1 = charging         0x2 = full
+ *   0xA = voltage/temp out of range
+ *   0xB = temperature error
+ *   0xF = charge fault
+ * Mic-mute LED state (input byte 55 bit 2 = DS_STATUS1_MIC_MUTE) tells
+ * you whether the *controller* thinks the mic is muted (toggled by user
+ * tapping the mute button). We expose the touch event but not the mute-
+ * persisted bit; useful pair with the power-save mic-mute output above.
+ *
+ * == Mute LED pulse mode ==
+ *
+ * `muteLed()` writes byte 12: 0 = off, 1 = solid, 2 = pulse (slow breath).
+ * We accept any uint8_t; sketches just pass 2 to get the pulse animation.
+ * Already supported, just under-documented in the public API.
+ *
+ * == Feature reports we don't read (would need a USB connection or a
+ *    GET_REPORT round-trip on the control PSM) ==
+ *
+ * Feature 0x05 (41 B): factory motion calibration -- per-axis bias +
+ *   sensitivity numerator/denominator. Without this, raw gyro / accel are
+ *   off by hundreds of LSBs; sketch has to compute its own offset. The
+ *   kernel reads this once at probe and applies a linear correction.
+ * Feature 0x09 (20 B): pairing info -- includes the controller's BT MAC
+ *   (we already get that from the BT link itself, so unnecessary).
+ * Feature 0x20 (64 B): firmware/hardware version + update_version, used
+ *   to gate vibration v2 (see above).
+ *
+ * == Other reserved input bytes ==
+ *
+ * Input bytes 12 (buttons[3]), 13..16, 33, 42..53, 56, 57..73 are zero on
+ * every firmware seen so far. If new firmware ever lights one of these
+ * up, `ps5.latestPacket` is the place to inspect it from a sketch.
+ *
+ * ----------------------------------------------------------------------------
  * ============================================================================
  */
 #include "ps5Controller.h"
@@ -155,6 +252,7 @@ enum { /* OUTPUT */
   WO_MOTOR_RIGHT    = 6,
   WO_MOTOR_LEFT     = 7,
   WO_MUTE_LED       = 12,
+  WO_POWER_SAVE     = 13,  /* bit 4 = DS_OUTPUT_POWER_SAVE_CONTROL_MIC_MUTE */
   WO_R2_TRIG_MODE   = 14,  /* +10 param bytes */
   WO_R2_TRIG_PARAM  = 15,
   WO_L2_TRIG_MODE   = 25,  /* +10 param bytes */
@@ -176,7 +274,9 @@ enum { /* OUTPUT */
 #define VF0_R2_TRIGGER_ENABLE      0x04
 #define VF0_L2_TRIGGER_ENABLE      0x08
 #define VF1_MIC_MUTE_LED_ENABLE    0x01
+#define VF1_POWER_SAVE_ENABLE      0x02   /* DS_OUTPUT_VALID_FLAG1_POWER_SAVE_CONTROL_ENABLE */
 #define VF1_LIGHTBAR_ENABLE        0x04
+#define VF1_RELEASE_LEDS           0x08   /* DS_OUTPUT_VALID_FLAG1_RELEASE_LEDS (one-shot) */
 #define VF1_PLAYER_LED_ENABLE      0x10
 #define VF2_LIGHT_BRIGHTNESS_ENABLE 0x01  /* gates byte 46 (player LED brightness) */
 #define VF2_LIGHTBAR_SETUP_ENABLE  0x02  /* gates byte 45 (lightbar fade-in cancel) */
@@ -213,6 +313,7 @@ enum { /* INPUT */
 #define STATUS0_CHARGING 0xF0
 #define STATUS1_HP      0x01
 #define STATUS1_MIC     0x02
+#define STATUS1_MIC_MUTE 0x04   /* DS_STATUS1_MIC_MUTE: persisted mute toggle */
 
 /* ============================================================ CRC32 (zlib) */
 
@@ -265,6 +366,10 @@ extern "C" void ps5BuildAndSend(void) {
   d[WO_VALID_FLAG2] = VF2_LIGHTBAR_SETUP_ENABLE | VF2_LIGHT_BRIGHTNESS_ENABLE;
 
   const ps5Controller::Out& o = ps5.output;
+  /* Optional output paths the user may have opted into. POWER_SAVE drives the
+   * actual mic-mute hardware bit (independent of the muteLed visual). */
+  if (o.micMute)     { d[WO_VALID_FLAG1] |= VF1_POWER_SAVE_ENABLE; d[WO_POWER_SAVE] |= 0x10; }
+  if (o.releaseLeds) { d[WO_VALID_FLAG1] |= VF1_RELEASE_LEDS; ps5.output.releaseLeds = false; }
   d[WO_MOTOR_RIGHT]    = o.smallRumble;
   d[WO_MOTOR_LEFT]     = o.largeRumble;
   d[WO_MUTE_LED]       = o.muteLed;
@@ -337,33 +442,40 @@ extern "C" void parsePacket(uint8_t* p) {
 
   uint8_t b0 = p[WI_BTN0], b1 = p[WI_BTN1], b2 = p[WI_BTN2];
 
+  /* Set a Button: update `cur` and latch the .pressed/.released edge flag. */
+  auto setBtn = [](ps5Controller::Button& b, bool v) {
+    if (v && !b.cur)      b.pressed.v  = true;
+    else if (!v && b.cur) b.released.v = true;
+    b.cur = v;
+  };
+
   /* D-pad - we expose the four cardinals; diagonals are derivable as e.g.
    * (ps5.up && ps5.right). Neutral = all four false. */
   uint8_t hat = b0 & BTN0_HAT_MASK;
   if (hat > 8) hat = 8;
   const HatBits& h = HAT_DECODE[hat];
-  ps5.up    = h.up || h.ne || h.nw;
-  ps5.down  = h.down || h.se || h.sw;
-  ps5.right = h.right || h.ne || h.se;
-  ps5.left  = h.left || h.nw || h.sw;
+  setBtn(ps5.up,    h.up   || h.ne || h.nw);
+  setBtn(ps5.down,  h.down || h.se || h.sw);
+  setBtn(ps5.right, h.right|| h.ne || h.se);
+  setBtn(ps5.left,  h.left || h.nw || h.sw);
 
-  ps5.square   = (b0 & BTN0_SQUARE);
-  ps5.cross    = (b0 & BTN0_CROSS);
-  ps5.circle   = (b0 & BTN0_CIRCLE);
-  ps5.triangle = (b0 & BTN0_TRIANGLE);
+  setBtn(ps5.square,   (b0 & BTN0_SQUARE));
+  setBtn(ps5.cross,    (b0 & BTN0_CROSS));
+  setBtn(ps5.circle,   (b0 & BTN0_CIRCLE));
+  setBtn(ps5.triangle, (b0 & BTN0_TRIANGLE));
 
-  ps5.l1      = (b1 & BTN1_L1);
-  ps5.r1      = (b1 & BTN1_R1);
+  setBtn(ps5.l1,      (b1 & BTN1_L1));
+  setBtn(ps5.r1,      (b1 & BTN1_R1));
   /* Digital L2/R2 booleans are exposed via the analog l2/r2 fields:
    * "pressed if > 0". Bits BTN1_L2/R2 carry the same info, so we drop
    * them rather than expose two duplicated representations. */
-  ps5.share   = (b1 & BTN1_CREATE);
-  ps5.options = (b1 & BTN1_OPTIONS);
-  ps5.l3      = (b1 & BTN1_L3);
-  ps5.r3      = (b1 & BTN1_R3);
-  ps5.ps_btn  = (b2 & BTN2_PS_HOME);
-  ps5.touchpad= (b2 & BTN2_TOUCHPAD);
-  ps5.mute    = (b2 & BTN2_MIC_MUTE);
+  setBtn(ps5.share,   (b1 & BTN1_CREATE));
+  setBtn(ps5.options, (b1 & BTN1_OPTIONS));
+  setBtn(ps5.l3,      (b1 & BTN1_L3));
+  setBtn(ps5.r3,      (b1 & BTN1_R3));
+  setBtn(ps5.ps_btn,  (b2 & BTN2_PS_HOME));
+  setBtn(ps5.touchpad,(b2 & BTN2_TOUCHPAD));
+  setBtn(ps5.mute,    (b2 & BTN2_MIC_MUTE));
 
   /* Motion (raw int16 LE). Kernel scale: gyro/1024 deg/s, accel/8192 g. */
   ps5.gyroX  = (int16_t)(p[WI_GYRO_X + 0] | (p[WI_GYRO_X + 1] << 8));
@@ -396,12 +508,14 @@ extern "C" void parsePacket(uint8_t* p) {
   uint8_t chg  = (st0 & STATUS0_CHARGING) >> 4;
   if (batt > 10) batt = 10;
   ps5.battery      = (uint8_t)(batt * 10);     /* 0..10 raw -> 0..100 %% */
-  ps5.charging     = (chg == 1);
-  ps5.fullyCharged = (chg == 2);
-  ps5.headphones   = (st1 & STATUS1_HP);
-  ps5.micJack      = (st1 & STATUS1_MIC);
+  ps5.charging      = (chg == 1);
+  ps5.fullyCharged  = (chg == 2);
+  ps5.chargingError = (chg == 0xA) || (chg == 0xB) || (chg == 0xF);
+  ps5.headphones    = (st1 & STATUS1_HP);
+  ps5.micJack       = (st1 & STATUS1_MIC);
+  ps5.micMuted      = (st1 & STATUS1_MIC_MUTE);
 
-  ps5.latestPacket = p;
+  ps5.latestPacket = p;          /* expose the raw 78-B wire buffer for debug */
 
   ps5_mark_alive();
 }
