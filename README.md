@@ -51,7 +51,7 @@ That's a full sketch. No callbacks, no event objects — the buttons are just fi
 2. Power up your ESP32 with `ps5.begin(20)` in `setup()`.
 3. The library finds the controller (~1–3 s) and connects.
 
-Pairing is remembered across reboots, so you only do this once per controller. If the controller goes to sleep or wanders out of range, the library quietly reconnects in the background.
+**Pairing is permanent.** The link key is stored by Bluedroid in its own NVS area, so a paired DualSense stays paired across ESP32 reboots automatically—you only do the pairing dance once per controller. On the next `begin()` call, a fresh BT inquiry finds the controller (~1–3 s typical) and reconnects instantly. If the controller goes to sleep or wanders out of range, the library quietly reconnects in the background every 5 seconds. Call `ps5.forget()` if you want to pair a different controller.
 
 ---
 
@@ -204,11 +204,34 @@ The same methods exist as `.r2*()` for the right trigger.
 
 | Call | What it does |
 |---|---|
+| `ps5.begin()` | Bring up Bluetooth, scan up to 30 s (default), auto-connect. |
 | `ps5.begin(20)` | Bring up Bluetooth, scan up to 20 s, auto-connect. |
 | `ps5.begin("AA:BB:CC:DD:EE:FF")` | Connect to a known MAC, skip the scan. |
 | `ps5.isConnected()` | True while packets are flowing. Auto-reconnects if not. Call every loop. |
 | `ps5.forget()` | Drop the latched controller; next `begin()` rescans. |
 | `ps5.scanDevices(secs, cb)` | Manual scan; calls `cb(mac, name, rssi)` per device. Doesn't connect. |
+
+---
+
+## Callbacks (optional)
+
+If you want to be notified of connection events or input packets, register callbacks:
+
+```cpp
+ps5.attach([]() {
+  // Fires every input packet (~250 Hz). Use for high-frequency polling.
+});
+
+ps5.attachOnConnect([]() {
+  // Fires once when the controller first sends an input packet (true "alive" moment).
+});
+
+ps5.attachOnDisconnect([]() {
+  // Fires when the L2CAP link drops.
+});
+```
+
+The callbacks are optional — if you don't register them, just read the `ps5` global fields directly in `loop()` (the simple approach shown in the hello-world example).
 
 ---
 

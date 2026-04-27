@@ -30,7 +30,7 @@ format (cross-checked against Linux's `drivers/hid/hid-playstation.c`).
         |
         v
    bluedroid/bluedroid.cpp    L2CAP transport (HID PSMs 0x11 + 0x13) +
-                              GAP/SPP bring-up. Vendored Bluedroid plumbing.
+                              GAP bring-up. Vendored Bluedroid plumbing.
    bluedroid/                 Vendored ESP-IDF Bluedroid internal headers.
                               (Implementations live inside the Arduino-ESP32
                               core's Bluedroid blob; only the headers are
@@ -40,28 +40,31 @@ format (cross-checked against Linux's `drivers/hid/hid-playstation.c`).
 ## How a connection happens
 
 1. Sketch calls `ps5.begin()` (or `ps5.begin(secs)` / `ps5.begin("AA:BB:..")`).
-2. `begin()` brings up the BT controller, Bluedroid, GAP, SPP, and registers
+2. `begin()` brings up the BT controller, Bluedroid, GAP, and registers
    HID **control** + **interrupt** PSMs (0x11 + 0x13) as L2CAP listeners.
-3. With no MAC stored yet, `begin()` runs an auto-pair scan: every unique
+3. With no saved MAC, `begin()` runs an auto-pair scan: every unique
    nearby device is added to a **growing linked list** (one node per MAC,
    ~10 B). Scan early-exits the moment a device named "DualSense" or
    "Wireless Controller" appears. Its MAC is fed to `ps5_l2cap_connect()`,
    which fires an outbound `L2CA_CONNECT_REQ` on PSM 0x11.
 4. Both L2CAP channels configure successfully → on the up-edge, bluedroid
    calls `ps5_scan_cache_release()` (frees the linked list, RAM goes back
-   to baseline) and `ps5ConnectEvent(true)` fires.
-5. `ps5ConnectEvent` calls `ps5Enable()`, which sends the magic feature
-   report `{0x53, 0xF4, 0x43, 0x02}` on the **control** channel — this
-   tells the DualSense to start streaming BT 0x31 input reports.
+   to baseline) and `ps5ConnectEvent(1)` fires.
+5. `ps5ConnectEvent(1)` calls `ps5Enable()`, which sends a full 79-byte
+   output report (0xA2 0x31 header + payload) on the **interrupt** channel.
+   This tells the DualSense firmware to enable the full BT 0x31 input-report
+   stream (the same format we send on, so no encryption/timing race).
 6. First input report arrives at `ps5_l2cap_data_ind_cback` →
    `parsePacket()` writes every field directly onto `ps5` (sticks,
    buttons, gyro, accel, touchpad, status), then calls `ps5_mark_alive()`.
-7. `ps5_mark_alive()` flips `g_active` true on its first call, fires the
-   user's `attachOnConnect` callback (real "alive" moment), and on every
-   subsequent call fires `attach`.
+7. `ps5_mark_alive()` flips `g_active` true on its first call, drains any
+   edge flags from the pairing gesture, fires the user's `attachOnConnect`
+   callback (real "alive" moment), and on every subsequent call fires the
+   `attach` callback.
 
 `isConnected()` auto-retries: when disconnected, it calls
-`ps5_l2cap_reconnect()` at most every 5 seconds.
+`ps5_l2cap_reconnect()` at most every 5 seconds, or runs `autoPair()` if
+no target MAC is latched.
 
 ## DualSense Bluetooth wire format (verified vs Linux kernel)
 
@@ -79,7 +82,7 @@ Sent on the HID **interrupt** channel (PSM 0x13). Layout:
 |   5    | valid_flag1                                              |
 |   6    | motor_right (small / high-frequency rumble)              |
 |   7    | motor_left  (large / low-frequency rumble)               |
-|  12    | mute LED (0=off, 1=on, 2=pulse)                          |
+|  12    | mute LED (0=off, 1=solid, 2=pulse)                      |
 |  14    | R2 trigger mode + 10 param bytes [15..24]                |
 |  25    | L2 trigger mode + 10 param bytes [26..35]                |
 |  42    | valid_flag2                                              |
@@ -152,7 +155,7 @@ Parsed by `parsePacket()` in `ps5_bytes.cpp`. Wire offsets:
 |--------|----------------------------------------------------------|
 |   0    | `0x31` report ID                                         |
 |   1    | reserved (BT seq)                                        |
-|   2-5  | LX, LY, RX, RY (uint8, centered at 128, Y inverted)      |
+|   2-5  | LX, LY, RX, RY (uint8, 0=min, 128=center, 255=max. Y: push UP = low, push DOWN = high) |
 |   6-7  | L2 / R2 analog triggers (0..255)                         |
 |   8    | report counter                                           |
 |   9    | low nibble = D-pad direction (0..7 + 8=neutral) +        |
@@ -163,7 +166,7 @@ Parsed by `parsePacket()` in `ps5_bytes.cpp`. Wire offsets:
 | 23-28  | accel X/Y/Z (le16 each, raw int16)                       |
 | 29-32  | sensor timestamp (le32, 0.33 us per LSB)                 |
 | 34-41  | touchpad: two 4-byte contacts                            |
-|  54    | status byte 0: battery (0..10) + charging nibble         |
+|  54    | status byte 0: battery (raw 0..10, converted to 0..100 percent) + charging nibble |
 |  55    | status byte 1: headphones (bit 0) + mic plug (bit 1)     |
 |  74-77 | CRC32 (we don't currently verify it on input)            |
 
@@ -200,13 +203,17 @@ respond from. The intended flow is:
 The ESP32 keeps its factory BT MAC; the MAC passed to `begin()` is the
 *controller's* address used to connect *to*.
 
-Note: pairing keys (link keys) are stored by Bluedroid itself in its own
-NVS area, so a paired DualSense stays paired across reboots without us
-needing to track its MAC. On every boot, `begin(timeoutSecs)` runs a
-fresh BT inquiry; the moment any device named "DualSense" or
+**Pairing persistence (REBOOTS)**: Pairing link keys are stored by Bluedroid
+itself in **its own NVS area**, not by esp-ps5. A paired DualSense stays
+paired across ESP32 reboots automatically — we don't need to track or save
+the controller's MAC ourselves. Bluedroid's link-key persistence is built
+into the ESP-IDF Bluetooth stack. On every boot, `begin(timeoutSecs)` runs
+a fresh BT inquiry; the moment any device named "DualSense" or
 "Wireless Controller" appears, the scan early-exits and the L2CAP
-connect fires. `ps5.forget()` clears the in-RAM target so the next
-`begin()` re-scans from scratch.
+connect fires. `ps5.forget()` clears only the **in-RAM target** (our local
+copy of the controller's MAC), forcing the next `begin()` to re-scan from
+scratch — but the Bluedroid link key persists in its NVS, so reconnect is
+typically instant once a device is found.
 
 ## Memory / CPU notes
 
@@ -254,17 +261,13 @@ connect fires. `ps5.forget()` clears the in-RAM target so the next
 
 - **Adaptive trigger byte encoding**: previous build used the deprecated
   "Simple_*" modes 0x01 / 0x02 / 0x06 with flat (pos, strength, freq)
-  bytes \u2014 those modes are documented as "do not use" by the kernel /
+  bytes — those modes are documented as "do not use" by the kernel /
   Nielk1 and the controller silently rejects them on most firmwares.
   Now uses the official zone-bitmask format: Feedback `0x21`, Weapon
   `0x25`, Vibration `0x26`, with active-zone u16 LE + 3-bit-packed force
   u32 LE in p1..p6 (Vibration adds raw-Hz frequency at p9). Rigid /
   Pulse with strength 0 collapse cleanly to mode 0x05.
-- **NVS auto-reconnect**: ESP32 now persists the controller's BT MAC to
-  NVS (`ps5`/`mac`) the first time a packet arrives, so subsequent
-  `begin()` calls skip the BT inquiry and fast-connect directly. Falls
-  back to a full scan if the saved controller is unreachable.
-  `ps5.forget()` wipes the entry. *(Removed 2026-05-01 — see below.)*
+  *(NVS MAC persistence was removed in 2026-05-01 — see below.)*
 
 ## Fixed (2026-04-28)
 
@@ -291,10 +294,10 @@ connect fires. `ps5.forget()` clears the in-RAM target so the next
   no-op'd.
 - **`led(r,g,b)` renamed to `lightbar(r,g,b)`** — disambiguates from the
   player LEDs.
-- **Edge detection in the library**: `ps5.pressed(field)` and
-  `ps5.released(field)` track per-bool previous state inside the library
-  (24-slot LRU table keyed by the field's address), so sketches no longer
-  need their own `wasX` shadow flags.
+- **Edge detection in the library**: buttons are now `struct Button { bool cur; EdgeFlag pressed; EdgeFlag released; }` 
+  with `operator bool()` returning the current state. `EdgeFlag` is consume-on-read (sets itself false after reading),
+  so edges stay latched until consumed — sketches never miss a press even in slow loops.
+  Replaces the old `ps5.pressed(field)` / `ps5.released(field)` methods + a 24-slot LRU table (~200 B RAM saved).
 - **Battery scale**: `ps5.battery` is now 0..100 percent (was 0..10 raw
   hardware units). Conversion happens in `parsePacket`: `batt * 10`.
 - **Stick / trigger percent helpers**: added inline `lxPct()/lyPct()/
@@ -321,7 +324,8 @@ connect fires. `ps5.forget()` clears the in-RAM target so the next
   AGENTS.md spec requires both channels to be configured), it spuriously
   flipped to disconnected. Now tracks each channel independently and the
   up-edge fires only when both are configured. Disconnect callback also
-  zeros both CIDs and the configured flags so reconnects start clean.
+  clears only the CID and configured flag for the specific channel that
+  was torn down, allowing partial reconnects to work correctly.
 - **Edge-slot table**: bumped from 16 to 24 entries to comfortably hold
   all 17 button bools plus user-added ones.
 - **CRC32 table moved to flash**: previously a 1 KB `static uint32_t
@@ -461,13 +465,13 @@ connect fires. `ps5.forget()` clears the in-RAM target so the next
   `DS_STATUS1_MIC_MUTE` (input byte 55 bit 2). Tracks the controller's
   *firmware-persisted* mute state (toggled by the user tapping the mute
   button), separate from `ps5.mute` which is the raw button edge.
-- **First-packet stall fix**: `isConnected()` now re-fires `ps5Enable()`
-  (the SET_FEATURE 0xF4/0x43/0x02 handshake) every 400 ms while the
-  L2CAP channels are up but no input report has arrived yet. The
-  DualSense occasionally drops the very first enable packet right after
-  channel setup, leaving the link in a permanent "channels up but
-  silent" stall. Cheap (4 bytes on the control PSM) and stops as soon
-  as the first packet flips `g_active`.
+- **First-packet stall fix**: `isConnected()` now re-fires a full 79-byte
+  output report on the interrupt PSM every 400 ms while the L2CAP channels
+  are up but no input report has arrived yet. The DualSense occasionally
+  doesn't respond to the initial enable handshake, leaving the link in a
+  permanent "channels up but silent" stall. Sending a full frame flips it
+  to streaming mode. Stops as soon as the first packet flips `g_active`.
+  *(Updated 2026-05-06 — see below.)*
 - **Mic hardware default = OFF**: `Out::micMute` now defaults to `true`,
   so on boot every send() carries the power-save bit (VF1 0x02 + byte 13
   bit 4) and the mic is electrically muted. ESP32 controller projects
@@ -476,7 +480,7 @@ connect fires. `ps5.forget()` clears the in-RAM target so the next
   sketch that *does* want the mic live calls `ps5.micMute(false)`.
 - **Example sketch**: `testEverything.ino` MUTE button handler now
   distinguishes short click (cycles `muteLed` 0→1→2 = off/solid/pulse)
-  from long press ≥600 ms (toggles real `micMute()` hw mute). SHARE
+  from long press ≥600 ms (toggles real `micMute()` hw mute). CROSS
   button is an on/off toggle that fires `releaseLeds()` and keeps
   re-arming that bit every frame so the firmware retains lightbar +
   player LEDs (second press flips back, sketch resumes writing them).
