@@ -25,6 +25,11 @@ void loop() {
 > Tags: **PS5** · **DualSense** · **ESP32** · **Bluetooth Classic** · **Gamepad** · **Sony** · **HID**
 
 ---
+## Preview 
+<img width="540" height="403" alt="ezgif com-speed" src="https://github.com/user-attachments/assets/af5aa939-e6fa-472d-adec-05e6ba25314e" />
+
+
+---
 
 ## Contents
 
