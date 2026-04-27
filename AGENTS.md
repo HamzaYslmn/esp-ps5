@@ -484,6 +484,25 @@ connect fires. `ps5.forget()` clears the in-RAM target so the next
   `output.micMute` field. Removed the old "mute LED mirrors button"
   one-liner that was stomping the user's pulse selection every frame.
 
+## Fixed (2026-05-06)
+
+- **First-pair stall**: `isConnected()` no longer re-kicks the legacy 0xF4
+  SET_FEATURE during the channels-up-but-silent window. It now sends a full
+  79-byte output report on the interrupt PSM every 400 ms, which is what
+  Bluepad32 (`uni_hid_parser_ds5.c`, `ds5_send_enable_lightbar_report`)
+  documents as the production trigger: *"sending an output report enables
+  input report 0x31"*. Same channel/format the input will come back on, so
+  no encryption/timing race on initial pair.
+- **Partial-tear reconnect race**: the 5-s `CONNECT_REQ` retry now also
+  requires `!ps5_l2cap_has_any_cid()` (both control + interrupt CIDs zero),
+  not just `!is_active`. Prevents firing CONNECT_REQ on a half-alive link
+  where one channel blipped but the other is still configured. New helper
+  `ps5_l2cap_has_any_cid()` exposed from bluedroid.cpp.
+- **FUTURE-WORK trim** in `ps5_bytes.cpp`: removed subsections that landed
+  in v1.3.1 (real mic mute, release LEDs, charging-error nibbles,
+  persisted mic-mute, mute-LED pulse note). Kept audio (transport-blocked),
+  vibration v2, feature reports 0x05/0x09/0x20, reserved input bytes.
+
 ## Fixed (2026-05-05)
 
 - **Release-LEDs link drop ("when LEDs handed back to firmware, connection

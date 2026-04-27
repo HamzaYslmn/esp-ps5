@@ -80,6 +80,13 @@ static uint16_t   l2cap_interrupt_channel = 0;
 // MARK: l2cap_has_target - true once a MAC has been latched (via connect()).
 bool ps5_l2cap_is_active(void) { return is_connected; }
 
+// MARK: l2cap_has_any_cid - true while EITHER channel still holds a CID.
+// Used by isConnected()'s reconnect guard so we never fire CONNECT_REQ on a
+// half-alive link (one channel torn down, the other still configured).
+bool ps5_l2cap_has_any_cid(void) {
+    return (l2cap_control_channel != 0) || (l2cap_interrupt_channel != 0);
+}
+
 bool ps5_l2cap_has_target(void) {
     for (int i = 0; i < 6; i++) if (g_bd_addr[i]) return true;
     return false;

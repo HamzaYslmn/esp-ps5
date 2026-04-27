@@ -173,14 +173,6 @@
  * Conclusion: volume / routing / mute *control* is a small future feature;
  * actual mic capture is a much larger project.
  *
- * == Power save (real mic mute, not just the LED) ==
- *
- * VF1 bit 1 = POWER_SAVE_CONTROL_ENABLE; byte 13 bit 4 = MIC_MUTE in the
- * power_save_control register. Setting these *electrically* mutes the mic
- * hardware (Linux pairs this with the touch-mute-button toggle). Today our
- * `muteLed()` only changes the orange LED above the mute button; it does
- * not gate the mic itself. Tiny future addition.
- *
  * == Compatible vibration v2 ==
  *
  * VF2 bit 2 = COMPATIBLE_VIBRATION2. Firmware feature-version >= 2.21
@@ -188,31 +180,6 @@
  * COMPATIBLE_VIBRATION (VF0 bit 0) we currently use. v1 still works on
  * new firmwares but Sony recommends v2. Reading the firmware version
  * needs feature report 0x20 (DS_FEATURE_REPORT_FIRMWARE_INFO, 64 B).
- *
- * == Release LEDs ==
- *
- * VF1 bit 3 = RELEASE_LEDS - hands lightbar / player LED control back to
- * the firmware (the controller reverts to its default boot animation).
- * Useful if a sketch wants to "let go" of the LEDs without rebooting.
- *
- * == Status nibble extras (input byte 54 / 55) ==
- *
- * Charging nibble (status[0] bits 4..7) values we currently lump into
- * `charging` / `fullyCharged`:
- *   0x0 = discharging       0x1 = charging         0x2 = full
- *   0xA = voltage/temp out of range
- *   0xB = temperature error
- *   0xF = charge fault
- * Mic-mute LED state (input byte 55 bit 2 = DS_STATUS1_MIC_MUTE) tells
- * you whether the *controller* thinks the mic is muted (toggled by user
- * tapping the mute button). We expose the touch event but not the mute-
- * persisted bit; useful pair with the power-save mic-mute output above.
- *
- * == Mute LED pulse mode ==
- *
- * `muteLed()` writes byte 12: 0 = off, 1 = solid, 2 = pulse (slow breath).
- * We accept any uint8_t; sketches just pass 2 to get the pulse animation.
- * Already supported, just under-documented in the public API.
  *
  * == Feature reports we don't read (would need a USB connection or a
  *    GET_REPORT round-trip on the control PSM) ==

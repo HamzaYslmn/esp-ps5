@@ -267,31 +267,24 @@ bool ps5Controller::begin(const char* mac) {
   return false;
 }
 
-/* Returns true while the controller is streaming input packets. Doubles as
- * the auto-reconnect / re-handshake heartbeat from `loop()`:
- *   - g_active true                                -> just return true.
- *   - channels up but no input yet                 -> re-fire the SET_FEATURE
- *     handshake every 400 ms (the controller sometimes ignores the very first
- *     enable packet right after channel setup; without retry we'd sit in
- *     "channels up but silent" forever).
- *   - link fully down + saved target               -> outbound CONNECT_REQ every 5 s.
- *   - link fully down + no target (cold start, pad off-line) -> rescan via autoPair(4).
- */
+/* True once input packets are flowing. Also drives auto-reconnect + the
+ * first-pair kick from loop(). */
 bool ps5Controller::isConnected() {
   if (g_active) return true;
   if (ps5_l2cap_is_active()) {
-    /* Channels up, waiting for first input packet. Re-kick the SET_FEATURE
-     * 0xF4 handshake periodically; the DualSense will start streaming as
-     * soon as one arrives. Cheap (4 bytes on the control PSM). */
+    /* Channels up, no input yet. Bluepad32 verified: a full output frame on
+     * the interrupt PSM flips the controller into 0x31 streaming. */
     static uint32_t kickAt = 0;
-    if (millis() - kickAt > 400UL) { kickAt = millis(); ps5Enable(); }
+    if (millis() - kickAt > 400UL) { kickAt = millis(); ps5BuildAndSend(); }
     return false;
   }
+  /* Both CIDs must be zero before reconnect - avoids hitting a half-alive link. */
+  if (ps5_l2cap_has_any_cid()) return false;
   static uint32_t tryAt = 0;
   if (millis() - tryAt > 5000UL) {
     tryAt = millis();
-    if (!ps5_l2cap_has_target()) autoPair(4);   /* cold start: nothing to retry */
-    else                         ps5_l2cap_reconnect();
+    if (!ps5_l2cap_has_target()) autoPair(4);   /* cold start: scan */
+    else                         ps5_l2cap_reconnect();   /* known MAC: retry */
   }
   return false;
 }

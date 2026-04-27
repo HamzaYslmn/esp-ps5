@@ -239,7 +239,7 @@ typedef struct { uint8_t data[ps5_SEND_BUFFER_SIZE]; uint8_t length; } hid_cmd_t
 /* ps5_bytes.cpp */
 void parsePacket(uint8_t* p);            /* writes flat fields on global ps5, fires _fireInput */
 void ps5BuildAndSend(void);              /* reads ps5.output, builds frame, sends on interrupt PSM */
-void ps5Enable(void);                    /* SET_FEATURE 0xF4 handshake on control PSM */
+void ps5Enable(void);                    /* SET_FEATURE 0xF4 handshake on control PSM (legacy one-shot) */
 
 /* ps5Controller.cpp */
 void ps5ConnectEvent(uint8_t isConnected);   /* called by L2CAP on link up/down */
@@ -250,6 +250,7 @@ long  ps5_l2cap_connect(uint8_t addr[6]);
 long  ps5_l2cap_reconnect(void);
 bool  ps5_l2cap_has_target(void);
 bool  ps5_l2cap_is_active(void);   /* both HID L2CAP channels configured */
+bool  ps5_l2cap_has_any_cid(void); /* either control or interrupt CID still non-zero */
 void  ps5_l2cap_get_target(uint8_t out[6]);
 void  ps5_l2cap_clear_target(void);
 void  ps5_l2cap_send_hid          (hid_cmd_t* c, uint8_t len);  /* control PSM 0x11   */
