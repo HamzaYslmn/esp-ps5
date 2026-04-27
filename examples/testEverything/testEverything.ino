@@ -72,7 +72,7 @@ static void stickToRumble(int8_t rx, int8_t ry) {
   ps5.output.largeRumble = (uint8_t)lR;
 }
 
-// SHARE-button on/off toggle for releaseLeds(). Defined here so snapshot()
+// CROSS-button on/off toggle for releaseLeds(). Defined here so snapshot()
 // (above) and handleLedsRelease() (below) can both see it.
 static bool ledsReleased = false;
 
@@ -243,20 +243,22 @@ static void handleMute() {
   }
 }
 
-// MARK: handleLedsRelease - SHARE button is an on/off toggle: first press
+// MARK: handleLedsRelease - CROSS button is an on/off toggle: first press
 // hands lightbar + player LEDs back to firmware (boot animation returns);
 // second press lets the sketch take control again (next pushOutputs sets
 // lightbar from the L-stick and player LEDs from tickPlayerLed).
-// `ledsReleased` also gates pushOutputs so we don't immediately stomp the
-// firmware animation while the user wants to see it.
+// IMPORTANT: while `ledsReleased` is true we MUST stop sending output
+// reports entirely. The firmware reads RELEASE_LEDS as "host is ceding
+// LED control" - if we keep streaming output frames the link drops.
+// pushOutputs() honours this by early-returning while the toggle is on.
 static void handleLedsRelease() {
-  if (!ps5.share.pressed) return;
+  if (!ps5.cross.pressed) return;
   ledsReleased = !ledsReleased;
   if (ledsReleased) {
-    ps5.releaseLeds().send();
-    Serial.println(F("[SHR ] LEDs -> firmware"));
+    ps5.releaseLeds().send();                         // fire ONCE, then go silent
+    Serial.println(F("[CROS] LEDs -> firmware"));
   } else {
-    Serial.println(F("[SHR ] LEDs -> sketch"));
+    Serial.println(F("[CROS] LEDs -> sketch"));
   }
 }
 
@@ -272,12 +274,13 @@ static void handleRawDump() {
 
 // MARK: pushOutputs - throttled (kSendMs) chained send: lightbar + rumble.
 // muteLed / micMute are toggled by handleMute() and persist in ps5.output
-// between sends, so we don't re-write them here. Skipped while the user
-// has handed LEDs back to firmware via SHARE.
+// between sends, so we don't re-write them here. Skipped entirely while
+// the user has handed LEDs back to firmware via CROSS - any output frame
+// in that state confuses the firmware and tears the link down.
 static void pushOutputs(uint32_t now) {
   if (now - tSend < kSendMs) return;
   tSend = now;
-  if (ledsReleased) { ps5.releaseLeds().send(); return; }   // re-arm each frame so firmware keeps the LEDs
+  if (ledsReleased) return;                                // GO SILENT - do not send anything
   stickToLightbar(ps5.lx, ps5.ly);
   stickToRumble  (ps5.rx, ps5.ry);
   ps5.send();

@@ -483,3 +483,34 @@ connect fires. `ps5.forget()` clears the in-RAM target so the next
   The 1 Hz snapshot prints `chargingError`, `micMuted`, and the new
   `output.micMute` field. Removed the old "mute LED mirrors button"
   one-liner that was stomping the user's pulse selection every frame.
+
+## Fixed (2026-05-05)
+
+- **Release-LEDs link drop ("when LEDs handed back to firmware, connection
+  drops")**: `testEverything.ino`'s `pushOutputs()` was re-firing
+  `ps5.releaseLeds().send()` every 10 ms throttle tick while the toggle was
+  on, so the controller saw a continuous stream of output frames *with* the
+  RELEASE_LEDS valid-flag bit set. Cross-checked against Linux
+  `drivers/hid/hid-playstation.c` (mainline 2026): the kernel **defines**
+  `DS_OUTPUT_VALID_FLAG1_RELEASE_LEDS = BIT(3)` but **never sets it
+  anywhere** — strong implication that firmware reads it as "host is ceding
+  control, stop sending output reports". Continuing to send output frames
+  in that state is contradictory, and after a couple of seconds the firmware
+  drops the L2CAP link as a reset. Fix is sketch-side: send `releaseLeds()`
+  ONCE on the toggle press, then `pushOutputs()` early-returns (sends
+  nothing) until the user toggles releaseLeds back off. Library-side
+  `releaseLeds` semantics already auto-clear after one frame, so no library
+  change was needed.
+- **CROSS rebind for releaseLeds**: per user request the release-LEDs
+  toggle moved from SHARE to CROSS (X face button). Updated handler name
+  reads `ps5.cross.pressed`, log strings now `[CROS]` instead of `[SHR ]`.
+- **Initial-pairing first-packet stall (still investigating)**: the
+  research pass found the kernel does NOT use the `0x53 0xF4 0x43 0x02`
+  magic packet to start full-report mode — it relies on issuing
+  `GET_REPORT(FEATURE, 0x05)` (calibration) on the control PSM, and the
+  controller's response flips it from minimal report `0x01` to streaming
+  the full `0x31` reports. We kept the existing `ps5Enable()` for v1.3.1
+  (the `0xF4` SET_FEATURE works ~95% of the time and changing it could
+  regress the working path); flagged for a follow-up where we'd send the
+  GET_REPORT(0x05) handshake instead and gracefully ignore the calibration
+  blob it returns.
