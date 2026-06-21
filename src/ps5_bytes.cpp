@@ -396,6 +396,14 @@ extern "C" void parsePacket(uint8_t* p) {
   /* Strip the HIDP DATA|INPUT transaction header (0xA1) if present. */
   if (p[0] == 0xA1) p++;
 
+  /* Only the full BT report (0x31) matches the offsets below. Until our
+   * SET_FEATURE 0xF4 / output-frame kick takes effect, the controller streams
+   * the compact USB-style 0x01 report. Accepting it here would read every field
+   * at the wrong offset AND latch g_active (via ps5_mark_alive), which stops the
+   * isConnected() kick - leaving the controller stuck in 0x01 forever. Bailing
+   * keeps g_active false so the kick keeps retrying until 0x31 arrives. */
+  if (p[0] != 0x31) return;
+
   /* Sticks: 0..255 (128 = center) -> signed int8 by raw-minus-128. The DualSense
    * wire already has up=low-raw and down=high-raw, so the same formula on X and
    * Y gives the documented convention: push UP = negative, push DOWN = positive,
