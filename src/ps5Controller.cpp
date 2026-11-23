@@ -73,6 +73,7 @@ void ps5_on_link(bool up) {
   if (up) {                                   /* first input report flips g_active */
     esp_bt_gap_cancel_discovery();            /* inbound reconnect may land mid-scan */
     ps5_send_output(false, false);            /* an output report starts the 0x31 stream */
+    ps5_get_feature(0x20);                    /* firmware version, then calibration (0x05) */
     return;
   }
   g_playing = false;
@@ -82,6 +83,10 @@ void ps5_on_link(bool up) {
 }
 
 void ps5_on_input(const uint8_t* p, uint16_t len) {
+  if (len > 2 && p[0] == 0xA3) {              /* feature report reply (control channel) */
+    if (ps5_parse_feature(p + 1, len - 1) == 0x20) ps5_get_feature(0x05);
+    return;
+  }
   /* First report: no edges, the user is usually still holding the pair gesture. */
   if (!ps5_parse(p, len, g_active)) return;
   uint32_t now = millis();
@@ -200,6 +205,7 @@ bool ps5Controller::begin(const char* mac) {
 }
 
 bool ps5Controller::isConnected() const { return g_active; }
+void ps5Controller::powerOff() { if (ps5_l2cap_up()) ps5_send_power_off(); }
 void ps5Controller::forget() {                /* unpair: drop target + link key */
   uint8_t mac[6];
   if (ps5_l2cap_target(mac)) esp_bt_gap_remove_bond_device(mac);

@@ -8,7 +8,7 @@ Protocol cross-checked against Linux `hid-playstation.c`, SDL `SDL_hidapi_ps5.c`
 ```
 src/ps5Controller.h      public API + internal glue declarations
 src/ps5Controller.cpp    bring-up, async scan/connect, output scheduling, LED gate, sound, trigger encoders
-src/ps5_bytes.cpp        all byte work: 0x31 parse, 0x31 / reset / 0x32 builders, ROM CRC32
+src/ps5_bytes.cpp        all byte work: 0x31 parse, 0x31 / reset / 0x32 builders, feature reports, ROM CRC32
 src/bluedroid/           L2CAP transport (PSM 0x11 + 0x13), page scan, hand-declared Bluedroid internals
 ```
 
@@ -18,7 +18,8 @@ src/bluedroid/           L2CAP transport (PSM 0x11 + 0x13), page scan, hand-decl
    page timeout 1.28 s, 400 ms `esp_timer` tick. Bonded pad in Bluedroid NVS → page it; else 5 s inquiry.
 2. Tick, while not connected: every ~5 s alternate paging the known pad / inquiry (inquiry finds a pad
    in pairing mode). Inbound reconnect (pad's PS press pages us) needs page scan, so inquiries stay short.
-3. Both channels configured → non-connectable, `ps5_on_link(true)` → one output frame (starts 0x31 input).
+3. Both channels configured → non-connectable, `ps5_on_link(true)` → one output frame (starts 0x31 input)
+   + GET feature 0x20 (firmware); its reply triggers GET 0x05 (calibration).
 4. Every input report (`ps5_on_input`, BT task): parse → LED gate → send pending output (≤ every 10 ms)
    → haptics frame if a melody is due. `send()` only sets a dirty flag.
 5. LED gate (SDL): pad plays its connect animation until its sensor clock ≥ 10200000 (0.33 µs ticks,
@@ -54,6 +55,17 @@ Reset-only frame: header + `0x10`, VF0 0, VF1 `0x08`, rest 0.
 over 0..138 at 139..142. Every 10.667 ms. Plays only while VF0 0x02 is clear (no firmware rumble).
 Speaker = report 0x36 with 200-byte Opus frames (48 kHz) — not implemented (needs libopus).
 
+## Feature reports (control channel)
+
+GET: `43 <id>` (no CRC). Reply: `A3 <id> …` + CRC32 (not checked); offsets below count `<id>` as 0.
+- `0x20` firmware (64 B): `ps5.firmware` = le16 at 44 (SDL). Firmware ≥ 2.24 offers "improved" rumble
+  (VF2 0x04, VF0 0x02): tested softer than VF0 0x01, so not used.
+- `0x05` calibration (41 B), le16: gyro bias pitch/yaw/roll 1,3,5; plus/minus pitch 7/9, yaw 11/13,
+  roll 15/17; speed plus/minus 19/21; accel plus/minus x 23/25, y 27/29, z 31/33.
+  gyro deg/s = (raw − bias) · (speed+ + speed−) / (plus − minus); accel g = (raw − (plus − range/2)) · 2 / range,
+  range = plus − minus. Rejected (nominal 1/16 deg/s, 1/8192 g kept) if |bias| > 1024 or scale off > 50 % (SDL).
+- SET `0x08` power off: `53 08 02` + zeros, 49 B, CRC32 of bytes 0..44 at 45..48 (DS5Dongle).
+
 ## Adaptive trigger modes (Nielk1; deprecated 0x01/0x02/0x06 not used)
 
 | Mode | Setter | Params |
@@ -78,7 +90,7 @@ Percent → zone `(pct*9+50)/100`, strength `(pct*8+50)/100` (0 → Off).
 | 9 | hat low nibble (0..7 N..NW, 8 neutral), □ ✕ ○ △ high nibble |
 | 10 | L1 R1 L2 R2 Create Options L3 R3 |
 | 11 | PS, touchpad, mute |
-| 17..22 / 23..28 | gyro / accel xyz le16 |
+| 17..22 / 23..28 | gyro / accel xyz le16 (raw gyro ≈ 16 LSB per deg/s, accel 8192 per g) |
 | 29..32 | sensor clock le32, 0.33 µs (LED gate; wraps ~24 min) |
 | 34..41 | touch ×2: `[id\|inactive<<7][x lo][x hi\|y lo<<4][y hi]` |
 | 54 | battery 0..10 + charging nibble (1 chg, 2 full, A/B/F error) |

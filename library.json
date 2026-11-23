@@ -1,6 +1,6 @@
 {
   "name": "esp-ps5",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "PS5 DualSense controller for ESP32 over Bluetooth Classic: input, LEDs, rumble, adaptive triggers, haptic melodies.",
   "keywords": "ps5, dualsense, esp32, bluetooth, gamepad, controller, hid",
   "repository": { "type": "git", "url": "https://github.com/HamzaYslmn/esp-ps5" },

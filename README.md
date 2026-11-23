@@ -21,7 +21,7 @@ void loop() {
 - **Board:** ESP32 with Classic BT (not S2/S3/C3). Arduino-ESP32 core **3.3.x or 4.x**; Huge APP partition recommended.
 - **Arduino IDE / arduino-cli:** install into `Documents/Arduino/libraries`. **PlatformIO:** `lib_deps = https://github.com/HamzaYslmn/esp-ps5` (needs a platform that ships core 3.x/4.x, e.g. pioarduino). **ESP-IDF:** usable as a component (`CMakeLists.txt`).
 - **Pair once:** hold **PS + Create** until the lightbar flashes. After that, pressing **PS** reconnects (the link key survives reboots).
-- `ps5.begin("AA:BB:CC:DD:EE:FF")` connects to one specific pad. `ps5.forget()` unpairs it.
+- `ps5.begin("AA:BB:CC:DD:EE:FF")` connects to one specific pad. `ps5.forget()` unpairs it. `ps5.powerOff()` switches it off.
 - Nothing blocks: scanning, connecting, reconnecting and sending all run on the Bluetooth task.
 - Demo of every feature: *File → Examples → esp-ps5 → testEverything*.
 
@@ -35,8 +35,10 @@ ps5.cross                   // held?  also circle square triangle up down left r
 ps5.cross.pressed           // edge, latched until read. also .released
                             // l1 r1 l3 r3 share options ps_btn touchpad mute
 ps5.touch[0].active/.x/.y   // 2 fingers, 1920 x 1080
-ps5.gyroX..Z, accelX..Z     // raw; /1024 = deg/s, /8192 = g
+ps5.gx, gy, gz              // deg/s (pitch, yaw, roll), factory-calibrated
+ps5.ax, ay, az              // g, factory-calibrated (raw: gyroX..Z, accelX..Z)
 ps5.battery                 // 0..100. also charging fullyCharged chargingError headphones micJack micMuted
+ps5.firmware                // e.g. 0x0630 = v6.30 (read at connect)
 ps5.latestPacket            // copy of the last raw 78-byte report
 ```
 

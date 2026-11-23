@@ -1,4 +1,4 @@
-/* ps5_bytes.cpp - DualSense BT wire format: 0x31 input parser + 0x31 output builder.
+/* ps5_bytes.cpp - DualSense BT wire format: 0x31 input, 0x31/0x32 output, feature reports.
  * Offset tables + valid-flag bits are documented in AGENTS.md; cross-check against
  * Linux drivers/hid/hid-playstation.c before changing anything here. */
 #include "ps5Controller.h"
@@ -13,11 +13,12 @@ enum {                           /* wire offsets, byte 0 = 0xA2 HID header (CRC'
   O_LEN = 79
 };
 
-/* 0xA2-prefixed frame: CRC32 (zlib, from ROM) of all but the last 4 bytes, stored LE in them. */
-static void sendCrc(uint8_t* d, uint8_t len) {
+/* Frame starting with its HIDP header (0xA2 output / 0x53 set-feature): CRC32 (zlib, from
+ * ROM) of all but the last 4 bytes, stored LE in them. */
+static void sendCrc(uint8_t* d, uint8_t len, bool control = false) {
   uint32_t crc = esp_rom_crc32_le(0, d, len - 4);
   memcpy(d + len - 4, &crc, 4);
-  ps5_l2cap_send(false, d, len);
+  ps5_l2cap_send(control, d, len);
 }
 
 /* SDL-style 0x31 frame. Seq nibble stays 0 (SDL never sets it).
@@ -29,8 +30,9 @@ void ps5_send_output(bool ready, bool leds) {
   bool snd = ps5.isPlaying();                  /* melody owns the actuators via 0x32 */
   uint8_t mr = snd ? 0 : o.smallRumble, ml = snd ? 0 : o.largeRumble;
   uint8_t d[O_LEN] = {0xA2, 0x31, 0x00, 0x10};
-  /* Rumble emulation (0x01) + "disable audio haptics" (0x02) only while motors run (SDL). */
-  d[O_VF0] = (mr || ml) ? 0x03 : 0x00;
+  /* Rumble emulation (0x01) + "disable audio haptics" (0x02), only while motors run (SDL).
+   * Firmware >= 2.24 also has an "improved" mode (VF2 0x04): tested softer, so not used. */
+  if (mr || ml) d[O_VF0] = 0x03;
   d[O_MOTOR_R] = mr;
   d[O_MOTOR_L] = ml;
   if (ready) {
@@ -67,6 +69,43 @@ void ps5_send_haptics(const int8_t* s) {
   uint8_t d[143] = {0xA2, 0x32, 0x00, 0x91, 0x07, 0xFE, 0, 0, 0, 0, 0xFF, n++, 0x92, 0x40};
   memcpy(d + 14, s, 64);
   sendCrc(d, sizeof(d));
+}
+
+/* ============================================================ feature reports (control channel) */
+
+void ps5_get_feature(uint8_t id) {             /* GET_REPORT(feature): reply arrives as 0xA3 id ... */
+  const uint8_t r[] = {0x43, id};
+  ps5_l2cap_send(true, r, sizeof(r));
+}
+
+void ps5_send_power_off() {                    /* SET_REPORT(feature 0x08) {0x02} = power off (DS5Dongle) */
+  uint8_t d[49] = {0x53, 0x08, 0x02};
+  sendCrc(d, sizeof(d), true);
+}
+
+/* Motion calibration: value = (raw - bias) * scale. Defaults are the nominal scales
+ * (gyro ~16 LSB per deg/s, accel 8192 LSB per g) until feature 0x05 arrives. */
+static float g_bias[6], g_scale[6] = {1 / 16.f, 1 / 16.f, 1 / 16.f, 1 / 8192.f, 1 / 8192.f, 1 / 8192.f};
+
+/* p[0] = report id (0xA3 header stripped). Offsets per SDL_hidapi_ps5.c. Returns the id. */
+uint8_t ps5_parse_feature(const uint8_t* p, uint16_t len) {
+  if (p[0] == 0x20 && len >= 46) ps5.firmware = p[44] | p[45] << 8;   /* e.g. 0x0224 = 2.24 */
+  if (p[0] == 0x05 && len >= 35) {
+    auto s = [&](int o) { return (float)(int16_t)(p[o] | p[o + 1] << 8); };
+    float b[6], k[6], speed = s(19) + s(21);   /* gyro: pitch, yaw, roll; then accel x, y, z */
+    for (int i = 0; i < 3; i++) {
+      b[i]     = s(1 + 2 * i);
+      k[i]     = speed / (s(7 + 4 * i) - s(9 + 4 * i));                 /* deg/s per LSB */
+      float range = s(23 + 4 * i) - s(25 + 4 * i);                       /* +1 g .. -1 g */
+      b[3 + i] = s(23 + 4 * i) - range / 2;
+      k[3 + i] = 2 / range;                                              /* g per LSB */
+    }
+    for (int i = 0; i < 6; i++)                /* SDL sanity check: else keep nominal */
+      if (!(fabsf(b[i]) <= 1024 && fabsf(k[i] * (i < 3 ? 16 : 8192) - 1) <= 0.5f)) return p[0];
+    memcpy(g_bias, b, sizeof(b));
+    memcpy(g_scale, k, sizeof(k));
+  }
+  return p[0];
 }
 
 /* ============================================================ input */
@@ -117,6 +156,9 @@ bool ps5_parse(const uint8_t* p, uint16_t len, bool edges) {
   ps5.gyroX  = le16(p + 17); ps5.gyroY  = le16(p + 19); ps5.gyroZ  = le16(p + 21);
   ps5.accelX = le16(p + 23); ps5.accelY = le16(p + 25); ps5.accelZ = le16(p + 27);
   uint32_t ts; memcpy(&ts, p + 29, 4); ps5.sensorTime = ts;
+  ps5.gx = (ps5.gyroX - g_bias[0]) * g_scale[0];  ps5.ax = (ps5.accelX - g_bias[3]) * g_scale[3];
+  ps5.gy = (ps5.gyroY - g_bias[1]) * g_scale[1];  ps5.ay = (ps5.accelY - g_bias[4]) * g_scale[4];
+  ps5.gz = (ps5.gyroZ - g_bias[2]) * g_scale[2];  ps5.az = (ps5.accelZ - g_bias[5]) * g_scale[5];
 
   for (int i = 0; i < 2; i++) {                /* [id|inactive<<7][x lo][x hi | y lo<<4][y hi] */
     const uint8_t* t = p + 34 + 4 * i;

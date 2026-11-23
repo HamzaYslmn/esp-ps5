@@ -42,7 +42,9 @@ class ps5Controller {
   Button cross, circle, square, triangle;
   Button share, options, ps_btn, touchpad, mute;
 
-  /* Raw motion. gyro / 1024 = deg/s, accel / 8192 = g. Written from the BT task. */
+  /* Motion. gx/gy/gz in deg/s (pitch, yaw, roll) and ax/ay/az in g, using the pad's
+   * factory calibration once read. Raw: gyro ~16 LSB per deg/s, accel 8192 LSB per g. */
+  float gx = 0, gy = 0, gz = 0, ax = 0, ay = 0, az = 0;
   volatile int16_t  gyroX = 0, gyroY = 0, gyroZ = 0;
   volatile int16_t  accelX = 0, accelY = 0, accelZ = 0;
   volatile uint32_t sensorTime = 0;          /* 0.33 us per LSB */
@@ -54,6 +56,7 @@ class ps5Controller {
   bool    charging = false, fullyCharged = false, chargingError = false;
   bool    headphones = false, micJack = false;
   bool    micMuted = false;                  /* firmware-persisted mute state */
+  uint16_t firmware = 0;                     /* e.g. 0x0224 = v2.24; 0 until read after connect */
 
   uint8_t latestPacket[78] = {};             /* copy of the last raw 0x31 input report */
 
@@ -74,7 +77,8 @@ class ps5Controller {
   bool begin();                        /* start BT; connect to the paired pad or scan. Returns at once. */
   bool begin(const char* mac);         /* connect to "AA:BB:CC:DD:EE:FF". Returns at once. */
   bool isConnected() const;            /* true while input reports are flowing */
-  void forget();                       /* drop the target MAC; next retry rescans */
+  void forget();                       /* unpair: drop the target + link key; next retry rescans */
+  void powerOff();                     /* switch the controller off */
 
   /* Chainable output setters. send() queues one frame; call it as often as you like
    * (sent from the BT task, at most every 10 ms). LEDs apply once the pad's own
@@ -129,6 +133,9 @@ extern ps5Controller ps5;
 bool ps5_parse(const uint8_t* p, uint16_t len, bool edges);   /* ps5_bytes.cpp */
 void ps5_send_output(bool ready, bool leds);
 void ps5_send_reset();
+void ps5_get_feature(uint8_t id);
+uint8_t ps5_parse_feature(const uint8_t* p, uint16_t len);   /* p = report id..., returns id */
+void ps5_send_power_off();
 void ps5_send_haptics(const int8_t* samples64);
 void ps5_on_link(bool up);                                    /* ps5Controller.cpp */
 void ps5_on_input(const uint8_t* p, uint16_t len);

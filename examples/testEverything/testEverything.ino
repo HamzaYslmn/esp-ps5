@@ -6,6 +6,7 @@
 //   SQUARE      -> player-LED brightness  CIRCLE      -> melody (haptic actuators)
 //   MUTE        -> mute LED off/on/pulse  OPTIONS     -> forget (unpair) controller
 //   CROSS (X)   -> give LEDs to the pad firmware / take them back
+//   CREATE      -> power the controller off
 //   TOUCHPAD    -> dump the raw input report
 //
 // loop() never blocks: work is paced with millis(), the library runs on the BT task.
@@ -51,6 +52,7 @@ static void buttons() {
   if (ps5.mute.pressed)     ps5.muteLed((ps5.output.muteLed + 1) % 3);
   if (ps5.circle.pressed)   ps5.play(kTune, sizeof(kTune) / sizeof(kTune[0]));
   if (ps5.options.pressed)  ps5.forget();
+  if (ps5.share.pressed)    ps5.powerOff();
   if (ps5.cross.pressed) {
     ps5.releaseLeds(!ps5.output.releaseLeds);
     Serial.println(ps5.output.releaseLeds ? "LEDs -> firmware" : "LEDs -> sketch");
@@ -74,10 +76,11 @@ static void stickColour(int8_t x, int8_t y) {
 }
 
 static void report() {
-  Serial.printf("L(%4d,%4d) R(%4d,%4d) L2 %3u R2 %3u  bat %u%%%s  gyro %6d %6d %6d  touch %s\n",
+  Serial.printf("L(%4d,%4d) R(%4d,%4d) L2 %3u R2 %3u  bat %u%%%s  fw %x.%02x\n",
                 ps5.lx, ps5.ly, ps5.rx, ps5.ry, ps5.l2, ps5.r2, ps5.battery,
-                ps5.charging ? " chg" : "", ps5.gyroX, ps5.gyroY, ps5.gyroZ,
-                ps5.touch[0].active ? "yes" : "no");
+                ps5.charging ? " chg" : "", ps5.firmware >> 8, ps5.firmware & 0xFF);
+  Serial.printf("  gyro %7.1f %7.1f %7.1f deg/s  accel %5.2f %5.2f %5.2f g  touch %s\n",
+                ps5.gx, ps5.gy, ps5.gz, ps5.ax, ps5.ay, ps5.az, ps5.touch[0].active ? "yes" : "no");
 }
 
 void loop() {
