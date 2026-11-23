@@ -1,502 +1,306 @@
-/* ps5Controller.cpp - Arduino-friendly DualSense (PS5) controller for ESP32.
- *
- * Owns:
- *   - The global `ps5` instance + its user callbacks.
- *   - Bluedroid bring-up (BT controller, Bluedroid, GAP, L2CAP).
- *   - Scan-and-pair (linked-list dedupe, freed on connect).
- *   - Auto-reconnect (driven from isConnected()).
- *
- * Does NOT touch any DualSense bytes - see ps5_bytes.cpp.
- */
-
+/* ps5Controller.cpp - BT bring-up, async scan/connect/reconnect, output setters.
+ * All DualSense byte work lives in ps5_bytes.cpp; L2CAP in bluedroid/. */
 #include "ps5Controller.h"
 
 #include <esp_bt.h>
-#include <esp_bt_defs.h>
 #include <esp_bt_main.h>
 #include <esp_gap_bt_api.h>
-#include <esp_log.h>
+#include <esp_timer.h>
 
-#define ps5_TAG "ps5"
+/* Core >= 3.3.9 / 4.x free Classic-BT RAM in initArduino() unless a library
+ * includes this header. Older cores keep it by default. */
+#if __has_include("esp32-hal-alloc-bt-classic-mem.h")
+#include "esp32-hal-alloc-bt-classic-mem.h"
+#endif
 
-#define ESP_BD_ADDR_HEX_PTR(a) \
-  (uint8_t*)(a)+0,(uint8_t*)(a)+1,(uint8_t*)(a)+2, \
-  (uint8_t*)(a)+3,(uint8_t*)(a)+4,(uint8_t*)(a)+5
+static volatile bool g_active   = false;   /* input reports flowing */
+static volatile bool g_scanning = false;
+static volatile bool g_found    = false;
+static esp_bd_addr_t g_foundMac;
 
-/* ============================================================ link state */
+/* ============================================================ link events (BT task) */
 
-static volatile bool g_active = false;   /* true once first input packet has arrived. volatile: written from Bluedroid task, read from loop() */
+void ps5_on_link(bool up) {
+  if (up) {                                   /* first input report flips g_active */
+    esp_bt_gap_cancel_discovery();            /* inbound reconnect may land mid-scan */
+    ps5_send_enable();
+    ps5_send_output();                        /* starts the 0x31 stream right away */
+    return;
+  }
+  bool was = g_active;
+  g_active = false;
+  if (was && ps5.onDisconnect) ps5.onDisconnect();
+}
 
-/* MARK: ps5ConnectEvent - C-side dispatcher.
- *   1 = link up   -> kick the SET_FEATURE handshake so the controller starts
- *                    streaming the BT 0x31 input report. (We don't fire the
- *                    user onConnect here - we wait for the first real packet
- *                    in parsePacket() so it's a true "alive" signal.)
- *   0 = link down -> drop the active flag and notify the user. */
-extern "C" void ps5ConnectEvent(uint8_t up) {
-  if (up) {
-    ps5Enable();
-  } else {
-    g_active = false;
-    ps5._fireConnState(false);
+void ps5_on_input(const uint8_t* p, uint16_t len) {
+  /* First report: no edges, the user is usually still holding the pair gesture. */
+  if (!ps5_parse(p, len, g_active)) return;
+  static bool leds = false;                   /* pad connect animation finished? */
+  bool ready = ps5_leds_ready();
+  if (!g_active) log_i("first report: sensorTime=%u", ps5.sensorTime);   /* DEBUG */
+  if (ready != leds) { leds = ready; log_i("leds ready=%d sensorTime=%u", ready, ps5.sensorTime); if (ready) ps5_send_output(true); }   /* reset LEDs once + push colours */
+  if (!g_active) { g_active = true; if (ps5.onConnect) ps5.onConnect(); }
+  if (ps5.onPacket) ps5.onPacket();
+}
+
+/* ============================================================ async scan */
+
+static bool isPad(const esp_bt_gap_cb_param_t* p) {
+  for (int i = 0; i < p->disc_res.num_prop; i++) {
+    const esp_bt_gap_dev_prop_t& pr = p->disc_res.prop[i];
+    uint8_t* s = nullptr; uint8_t n = 0;
+    if (pr.type == ESP_BT_GAP_DEV_PROP_BDNAME) { s = (uint8_t*)pr.val; n = pr.len; }
+    else if (pr.type == ESP_BT_GAP_DEV_PROP_EIR) {
+      s = esp_bt_gap_resolve_eir_data((uint8_t*)pr.val, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &n);
+      if (!s) s = esp_bt_gap_resolve_eir_data((uint8_t*)pr.val, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &n);
+    }
+    if (!s || !n) continue;
+    char name[32] = {};
+    memcpy(name, s, n < sizeof(name) ? n : sizeof(name) - 1);
+    if (strstr(name, "DualSense") || strstr(name, "Wireless Controller")) return true;
+  }
+  return false;
+}
+
+static void onGap(esp_bt_gap_cb_event_t e, esp_bt_gap_cb_param_t* p) {
+  if (e == ESP_BT_GAP_DISC_RES_EVT && !g_found && isPad(p)) {
+    memcpy(g_foundMac, p->disc_res.bda, 6);
+    g_found = true;
+    esp_bt_gap_cancel_discovery();            /* connect once inquiry has stopped */
+  } else if (e == ESP_BT_GAP_DISC_STATE_CHANGED_EVT &&
+             p->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+    g_scanning = false;
+    if (g_found) { g_found = false; if (ps5_l2cap_idle()) ps5_l2cap_connect(g_foundMac); }
   }
 }
 
-/* Called from parsePacket() once per input report. First call doubles as the
- * real "controller is alive" moment - that's when we fire onConnect. */
-extern "C" void ps5_mark_alive(void) {
-  if (!g_active) {
-    g_active = true;
-    /* Drain any "pressed" / "released" edges generated by THIS first packet.
-     * The user is commonly still holding PS+CREATE (the pair gesture) when
-     * the link comes up, so the first frame can light up SHARE, PS, and
-     * even random face buttons. We don't want sketches to see those as
-     * real user actions - the user starts pressing AFTER they see "UP". */
-    ps5Controller::Button* all[] = {
-      &ps5.l1, &ps5.r1, &ps5.l3, &ps5.r3,
-      &ps5.up, &ps5.down, &ps5.left, &ps5.right,
-      &ps5.cross, &ps5.circle, &ps5.square, &ps5.triangle,
-      &ps5.share, &ps5.options, &ps5.ps_btn, &ps5.touchpad, &ps5.mute,
-    };
-    for (auto* b : all) { b->pressed.v = false; b->released.v = false; }
-    ps5._fireConnState(true);
-  }
-  ps5._fireInput();
+static void startScan() {
+  if (g_scanning) return;
+  /* 5 s bursts: an inquiry starves page scan, which inbound reconnects need. */
+  g_scanning = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 4, 0) == ESP_OK;
 }
 
-/* ============================================================ bring-up */
+/* ============================================================ background tick (esp_timer task) */
 
-static bool ensureBT() {
-  if (!btStarted() && !btStart())                                         { log_e("btStart failed"); return false; }
-  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED &&
-      esp_bluedroid_init() != ESP_OK)                                     { log_e("bluedroid_init"); return false; }
-  if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED &&
-      esp_bluedroid_enable() != ESP_OK)                                   { log_e("bluedroid_enable"); return false; }
+static void tick(void*) {
+  static uint8_t n = 0;
+  if (g_active) return;
+  if (ps5_l2cap_up()) { ps5_send_output(); return; }  /* channels up, no input yet: kick */
+  if (g_scanning || !ps5_l2cap_idle() || ++n < 12) return;   /* retry every ~5 s */
+  n = 0;
+  /* Alternate: page the known pad / inquire (finds a pad in pairing mode, e.g. re-pair). */
+  static bool page = false;
+  if (ps5_l2cap_target(nullptr) && (page = !page)) ps5_l2cap_connect(nullptr);
+  else                                             startScan();
+}
+
+/* ============================================================ sound (esp_timer, every 10.667 ms) */
+
+static esp_timer_handle_t g_snd;
+static const ps5Controller::Note* g_notes;
+static size_t   g_left;
+static ps5Controller::Note g_one;            /* storage for tone() */
+static uint32_t g_phase, g_step, g_noteLeft;  /* DDS phase, phase step, samples left in note */
+static int8_t   g_amp;
+static uint32_t g_rl, g_rr;                   /* rumble phases (left 40 Hz, right 120 Hz) */
+static volatile bool g_playing = false;
+
+static int8_t wave(uint32_t ph, int a) { return (ph & 0x80000000u) ? a : -a; }
+static int8_t clip(int v) { return constrain(v, -127, 127); }
+
+static void soundTick(void*) {
+  int8_t s[64] = {};
+  /* Haptics mode turns off firmware rumble, so mix rumble into the PCM ourselves. */
+  int lA = ps5.output.largeRumble >> 1, rA = ps5.output.smallRumble >> 1;
+  for (int i = 0; i < 64 && g_active; i += 2) {
+    s[i]     = clip(wave(g_rl += 57266230u, lA));        /* 2^32 * 40 / 3000 */
+    s[i + 1] = clip(wave(g_rr += 171798692u, rA));       /* 2^32 * 120 / 3000 */
+    while (!g_noteLeft) {
+      if (!g_left) { esp_timer_stop(g_snd); g_playing = false; break; }
+      g_step = (uint32_t)(((uint64_t)g_notes->hz << 32) / 3000);
+      g_noteLeft = g_notes->ms * 3u;           /* 3 samples per ms */
+      g_notes++; g_left--;
+    }
+    if (!g_playing) break;
+    int8_t m = g_step ? wave(g_phase, g_amp) : 0;
+    s[i] = clip(s[i] + m); s[i + 1] = clip(s[i + 1] + m);
+    g_phase += g_step;
+    g_noteLeft--;
+  }
+  if (!g_active) { esp_timer_stop(g_snd); g_playing = false; return; }
+  ps5_send_haptics(s);                        /* last frame is padded with silence */
+}
+
+void ps5Controller::play(const Note* notes, size_t count, uint8_t volume) {
+  stopSound();
+  if (!g_snd || !g_active || !notes || !count) return;
+  g_notes = notes; g_left = count; g_noteLeft = 0; g_phase = 0;
+  g_amp = min<uint8_t>(volume, 100) * 127 / 100;
+  g_playing = true;
+  esp_timer_start_periodic(g_snd, 10667);
+}
+void ps5Controller::tone(uint16_t hz, uint16_t ms, uint8_t volume) { stopSound(); g_one = {hz, ms}; play(&g_one, 1, volume); }
+void ps5Controller::stopSound() { if (g_snd) esp_timer_stop(g_snd); g_playing = false; }
+bool ps5Controller::isPlaying() const { return g_playing; }
+
+static bool bringUp() {
+  static bool done = false;
+  if (done) return true;
+  if (!btStarted() && !btStart()) { log_e("btStart failed"); return false; }
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED && esp_bluedroid_init() != ESP_OK) return false;
+  if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED && esp_bluedroid_enable() != ESP_OK) return false;
+  esp_bt_gap_register_callback(onGap);
+  esp_bt_gap_set_page_timeout(0x0800);        /* 1.28 s: paging a sleeping pad can't hog the radio */
+  ps5_l2cap_init();                           /* also sets fast page scan */
+  const esp_timer_create_args_t args = { .callback = tick, .name = "ps5" };
+  esp_timer_handle_t t;
+  if (esp_timer_create(&args, &t) != ESP_OK || esp_timer_start_periodic(t, 400000) != ESP_OK) return false;
+  const esp_timer_create_args_t snd = { .callback = soundTick, .name = "ps5snd" };
+  if (esp_timer_create(&snd, &g_snd) != ESP_OK) return false;
+  return done = true;
+}
+
+/* ============================================================ public API */
+
+bool ps5Controller::begin() {
+  if (!bringUp()) return false;
+  /* Already paired (link key in Bluedroid NVS)? Page it directly, no inquiry. */
+  int n = 1; esp_bd_addr_t bonded;
+  if (!ps5_l2cap_target(nullptr) && esp_bt_gap_get_bond_device_list(&n, &bonded) == ESP_OK && n > 0)
+    ps5_l2cap_connect(bonded);
+  else if (ps5_l2cap_target(nullptr)) ps5_l2cap_connect(nullptr);
+  else startScan();
   return true;
 }
 
-static void ensureServices() {
-  static bool up = false;
-  if (up) return;
-  /* Make us connectable to inbound BT links (no need to be discoverable -
-   * the controller knows our MAC after pairing). Replaces the old SPP-init
-   * dance whose only purpose was to land here from a callback. */
-  esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-  ps5_l2cap_init_services();
-  up = true;
-}
-
-/* ============================================================ scan dedupe.
- *
- * During an inquiry every nearby device emits multiple ESP_BT_GAP_DISC_RES_EVT
- * (one per advertising packet seen). We only want to surface a unique device
- * to the user / auto-pair filter once.
- *
- * A singly-linked list grows during the scan (one node = 6 B MAC + 1 next
- * pointer = ~10 B). When a connection is established (or the next scan
- * begins), the list is freed. RAM usage is therefore proportional to the
- * actual count of distinct nearby BT devices, not a fixed cap. */
-
-namespace {
-  struct Seen { uint8_t mac[6]; Seen* next; };
-  Seen* g_seen = nullptr;
-
-  bool seenAddOrSkip(const uint8_t mac[6]) {
-    for (Seen* n = g_seen; n; n = n->next)
-      if (memcmp(n->mac, mac, 6) == 0) return true;
-    Seen* n = (Seen*)malloc(sizeof(Seen));
-    if (!n) return true;   /* OOM: pretend already seen so we don't re-fire */
-    memcpy(n->mac, mac, 6); n->next = g_seen; g_seen = n;
-    return false;
-  }
-
-  void seenClear() {
-    while (g_seen) { Seen* n = g_seen->next; free(g_seen); g_seen = n; }
-  }
-}
-
-/* Public so bluedroid.cpp can drop the cache the moment L2CAP comes up. */
-extern "C" void ps5_scan_cache_release(void) { seenClear(); }
-
-/* ============================================================ scan core */
-
-namespace {
-  ps5Controller::scan_cb_t gScanCb = nullptr;
-
-  /* GAP discovery callback - resolves name/RSSI, dedupes, calls user cb. */
-  void onDiscovery(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* p) {
-    if (event != ESP_BT_GAP_DISC_RES_EVT || !gScanCb) return;
-    if (seenAddOrSkip(p->disc_res.bda)) return;
-
-    char   name[32] = {0};
-    int8_t rssi     = 0;
-    for (int i = 0; i < p->disc_res.num_prop; i++) {
-      esp_bt_gap_dev_prop_t* prop = &p->disc_res.prop[i];
-      if (prop->type == ESP_BT_GAP_DEV_PROP_BDNAME && prop->len > 0) {
-        size_t n = (size_t)prop->len < sizeof(name) - 1 ? (size_t)prop->len : sizeof(name) - 1;
-        memcpy(name, prop->val, n);
-      } else if (prop->type == ESP_BT_GAP_DEV_PROP_EIR) {
-        uint8_t blen = 0;
-        uint8_t* bn = esp_bt_gap_resolve_eir_data((uint8_t*)prop->val,
-                       ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &blen);
-        if (!bn) bn = esp_bt_gap_resolve_eir_data((uint8_t*)prop->val,
-                       ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &blen);
-        if (bn && blen) {
-          size_t n = blen < sizeof(name) - 1 ? blen : sizeof(name) - 1;
-          memcpy(name, bn, n);
-        }
-      } else if (prop->type == ESP_BT_GAP_DEV_PROP_RSSI) {
-        rssi = *(int8_t*)prop->val;
-      }
-    }
-    log_i("scan: %02x:%02x:%02x:%02x:%02x:%02x  rssi=%d  name=\"%s\"",
-          p->disc_res.bda[0], p->disc_res.bda[1], p->disc_res.bda[2],
-          p->disc_res.bda[3], p->disc_res.bda[4], p->disc_res.bda[5],
-          rssi, name[0] ? name : "?");
-    gScanCb(p->disc_res.bda, name, rssi);
-  }
-
-  /* Run a BT inquiry. Calls cb per UNIQUE device. Optional early-exit hook
-   * lets autoPair stop the moment a DualSense shows up. */
-  bool runScan(uint8_t secs, ps5Controller::scan_cb_t cb, volatile bool* earlyExit) {
-    if (!cb) return false;
-    if (!ensureBT()) return false;
-    seenClear();
-    gScanCb = cb;
-    esp_bt_gap_register_callback(onDiscovery);
-
-    uint8_t units = (uint8_t)((secs * 100 + 127) / 128);   /* 1.28-s units */
-    if (units < 1) units = 1;
-    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, units, 0);
-
-    uint32_t deadline = millis() + (uint32_t)secs * 1000UL + 1500UL;
-    while (millis() < deadline) {
-      if (earlyExit && *earlyExit) break;
-      vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    esp_bt_gap_cancel_discovery();
-    gScanCb = nullptr;
-    return true;
-  }
-}
-
-/* User-driven scan: runs a BT inquiry for `secs` seconds and calls `cb` for
- * every UNIQUE device seen. Use it to build a UI/debug list of nearby BT
- * devices. Does NOT auto-connect. (For auto-connect use `begin()`.) */
-bool ps5Controller::scanDevices(uint8_t secs, scan_cb_t cb) {
-  bool ok = runScan(secs, cb, nullptr);
-  seenClear();   /* user-driven scan: drop the dedupe list before returning */
-  return ok;
-}
-
-/* ============================================================ auto-pair */
-
-namespace {
-  esp_bd_addr_t  gApMac    = {0};
-  volatile bool  gApFound  = false;
-
-  void onAutoPair(const uint8_t mac[6], const char* name, int8_t rssi) {
-    if (gApFound || !name || !*name) return;
-    if (!strstr(name, "DualSense") && !strstr(name, "Wireless Controller")) return;
-    memcpy(gApMac, mac, 6);
-    gApFound = true;
-    log_i("auto-pair: %02x:%02x:%02x:%02x:%02x:%02x rssi=%d (%s)",
-          mac[0],mac[1],mac[2],mac[3],mac[4],mac[5], rssi, name);
-  }
-
-  bool autoPair(uint8_t timeoutSecs) {
-    if (timeoutSecs < 2) timeoutSecs = 2;
-    gApFound = false;
-    if (!runScan(timeoutSecs, onAutoPair, &gApFound)) return false;
-    if (!gApFound) return false;
-    ps5_l2cap_connect(gApMac);
-    /* Don't free the seen list here - bluedroid will call
-     * ps5_scan_cache_release() once L2CAP actually configures, so a failed
-     * connect attempt can still skip already-seen MACs on the next retry. */
-    return true;
-  }
-}
-
-/* ============================================================ begin / connect */
-
-/* Bring the whole stack up and auto-connect to the first DualSense found.
- * Scans for up to `timeoutSecs` (default ~20s) but EARLY-EXITS the moment
- * a device named "DualSense" / "Wireless Controller" is seen, so typical
- * connect time is ~1-3 s. Returns true if the bring-up succeeded; the
- * actual connection completes asynchronously - poll `ps5.isConnected()`. */
-bool ps5Controller::begin(uint8_t timeoutSecs) {
-  if (!ensureBT()) return false;
-  ensureServices();
-
-  if (!ps5_l2cap_has_target()) {
-    log_i("ps5.begin(): scanning up to %us for a DualSense...", timeoutSecs);
-    if (!autoPair(timeoutSecs))
-      log_e("ps5.begin(): no DualSense found within %us. Will keep retrying via isConnected().", timeoutSecs);
-  } else {
-    ps5_l2cap_reconnect();
-  }
-  return true;
-}
-
-/* Drop the latched controller MAC from RAM so the next `begin()` re-scans
- * from scratch. Useful when switching to a different DualSense. (The link
- * key itself stays in Bluedroid's NVS; this only clears our target ptr.) */
-void ps5Controller::forget() {
-  ps5_l2cap_clear_target();
-}
-
-/* Connect to a SPECIFIC controller by its BT MAC string ("AA:BB:CC:DD:EE:FF").
- * Skips the inquiry scan and fires a direct outbound L2CAP connect, then
- * BLOCKS up to 10 s waiting for the first input packet. Returns true on
- * success, false on parse error or timeout. Useful when you already know
- * which DualSense you want and don't want any scanning at all. */
 bool ps5Controller::begin(const char* mac) {
-  esp_bd_addr_t addr;
-  if (sscanf(mac, ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX_PTR(addr)) != ESP_BD_ADDR_LEN) {
-    log_e("Could not convert %s to a MAC address", mac); return false;
+  uint8_t a[6];
+  if (sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5]) != 6) {
+    log_e("bad MAC %s", mac); return false;
   }
-  if (!ensureBT()) return false;
-  ensureServices();
-  ps5_l2cap_connect(addr);
-
-  uint32_t deadline = millis() + 10000UL;
-  while (millis() < deadline) {
-    if (g_active) return true;
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-  return false;
+  if (!bringUp()) return false;
+  ps5_l2cap_connect(a);
+  return true;
 }
 
-/* True once input packets are flowing. Also drives auto-reconnect + the
- * first-pair kick from loop(). */
-bool ps5Controller::isConnected() {
-  if (g_active) return true;
-  if (ps5_l2cap_is_active()) {
-    /* Channels up, no input yet. Bluepad32 verified: a full output frame on
-     * the interrupt PSM flips the controller into 0x31 streaming. */
-    static uint32_t kickAt = 0;
-    if (millis() - kickAt > 400UL) { kickAt = millis(); ps5BuildAndSend(); }
-    return false;
-  }
-  /* Both CIDs must be zero before reconnect - avoids hitting a half-alive link. */
-  if (ps5_l2cap_has_any_cid()) return false;
-  static uint32_t tryAt = 0;
-  if (millis() - tryAt > 5000UL) {
-    tryAt = millis();
-    if (!ps5_l2cap_has_target()) autoPair(4);   /* cold start: scan */
-    else                         ps5_l2cap_reconnect();   /* known MAC: retry */
-  }
-  return false;
+bool ps5Controller::isConnected() const { return g_active; }
+void ps5Controller::forget() {                /* unpair: drop target + link key */
+  uint8_t mac[6];
+  if (ps5_l2cap_target(mac)) esp_bt_gap_remove_bond_device(mac);
+  ps5_l2cap_forget();
 }
 
-/* ============================================================ output (fluent) */
+ps5Controller& ps5Controller::lightbar(uint8_t r, uint8_t g, uint8_t b) { output.r = r; output.g = g; output.b = b; return *this; }
+ps5Controller& ps5Controller::rumble(uint8_t s, uint8_t l) { output.smallRumble = s; output.largeRumble = l; return *this; }
+ps5Controller& ps5Controller::muteLed(uint8_t m)  { output.muteLed = m; return *this; }
+ps5Controller& ps5Controller::micMute(bool on)    { output.micMute = on; return *this; }
+ps5Controller& ps5Controller::send()              { if (g_active) ps5_send_output(); return *this; }
 
-/* Set lightbar RGB (0..255 each). Stages into output buffer; call send(). */
-ps5Controller& ps5Controller::lightbar(uint8_t r, uint8_t g, uint8_t b) {
-  output.r = r; output.g = g; output.b = b; return *this;
-}
-/* Set rumble strength. small = high-freq motor (right grip), large = low-
- * freq motor (left grip), 0..255. Stages; call send(). */
-ps5Controller& ps5Controller::rumble(uint8_t small, uint8_t large) {
-  output.smallRumble = small; output.largeRumble = large; return *this;
-}
-/* Player LED #index (1..5, left to right). value=0 turns that LED off;
- * value 1=dim, 2=mid, 3+=bright. Brightness is shared by ALL on LEDs. */
 ps5Controller& ps5Controller::playerLed(uint8_t index, uint8_t value) {
   if (index < 1 || index > 5) return *this;
-  uint8_t bit = (uint8_t)(1u << (index - 1));
-  if (value == 0) {
-    output.playerLeds &= (uint8_t)~bit;       // off; don't touch brightness
-  } else {
-    output.playerLeds |= bit;
-    // API value 1=dim, 2=mid, 3+=bright. Wire is inverted: 0=bright,1=mid,2=dim.
-    uint8_t wire = (value >= 3) ? 0 : (value == 2 ? 1 : 2);
-    output.ledBrightness = wire;
-  }
-  return *this;
-}
-/* Mic-mute LED: 0=off, 1=on, 2=pulse. */
-ps5Controller& ps5Controller::muteLed(uint8_t mode) {
-  output.muteLed = mode; return *this;
-}
-/* Electrically mute / un-mute the mic hardware (separate from the LED). */
-ps5Controller& ps5Controller::micMute(bool on) {
-  output.micMute = on; return *this;
-}
-/* One-shot: hand lightbar/player-LED control back to firmware. */
-ps5Controller& ps5Controller::releaseLeds() {
-  output.releaseLeds = true; return *this;
-}
-/* Build the 79-byte BT 0x31 OUTPUT report from the staged `output` struct
- * (lightbar, rumble, player LEDs, mute LED, adaptive triggers) and write
- * it on the HID interrupt PSM. No-op if not fully connected. Don't call
- * faster than ~10 ms apart or the L2CAP TX queue congests. */
-ps5Controller& ps5Controller::send() {
-  /* Don't write to L2CAP unless the controller is fully alive. Sending during
-   * the half-connected window (or after a remote-initiated tear-down that we
-   * haven't observed yet) crashes the BT stack on a stale CID. */
-  if (g_active) ps5BuildAndSend();
+  uint8_t bit = 1u << (index - 1);
+  if (!value) { output.playerLeds &= ~bit; return *this; }
+  output.playerLeds |= bit;
+  output.ledBrightness = value >= 3 ? 0 : value == 2 ? 1 : 2;   /* wire is inverted */
   return *this;
 }
 
 /* ============================================================ adaptive triggers
- *
- * Public API takes percent (0..100). Hardware uses quantised zones:
- *   position : 0..9   (10 trigger zones)
- *   strength : 0..8   (9 force levels; 0 = effect off)
- *
- *   trigger block is: [mode][p0..p9].
- *
- *   Off       (0x05) : all params 0.
- *   Feedback  (0x21) : "rigid wall" past `position`. Active across zones
- *                       [position..9]. p1..p2 = uint16 LE active-zone bitmask;
- *                       p3..p6 = uint32 LE force-zone packed 3-bit values
- *                       (((strength-1)&7) << (3*i)) per active zone.
- *   Weapon    (0x25) : "trigger break" between start..end (start in 2..7,
- *                       end in start+1..8). p1..p2 = (1<<start)|(1<<end);
- *                       p3 = strength-1.
- *   Vibration (0x26) : pulses past `position`. Same active/strength packing
- *                       as Feedback but the strength bytes encode amplitude.
- *                       p9 = frequency in Hz (raw byte).
- *
- */
-
+ * Block = [mode][p0..p9]. Zones: position 0..9, strength 1..8 (0 = off).
+ *   0x05 Off, 0x21 Feedback, 0x25 Weapon, 0x26 Vibration,
+ *   0x22 Bow, 0x23 Galloping, 0x27 Machine (Nielk1 spec, see AGENTS.md). */
 namespace {
-inline uint8_t pctToPos     (uint8_t pct) { if (pct > 100) pct = 100; return (uint8_t)((pct * 9 + 50) / 100); }
-inline uint8_t pctToStrength(uint8_t pct) { if (pct > 100) pct = 100; return (uint8_t)((pct * 8 + 50) / 100); }
+uint8_t pos(uint8_t pct) { return (min<uint8_t>(pct, 100) * 9 + 50) / 100; }
+uint8_t str(uint8_t pct) { return (min<uint8_t>(pct, 100) * 8 + 50) / 100; }
 
-/* Shared low-level writers used by every mode below. */
-inline void writeMask(uint8_t* p, uint16_t m) { p[0] = (uint8_t)m;        p[1] = (uint8_t)(m >> 8); }
-inline void setOff   (uint8_t* m, uint8_t* p) { *m = 0x05; memset(p, 0, 10); }
+uint8_t* mode(uint8_t* t, uint8_t m) { memset(t, 0, 11); t[0] = m; return t + 1; }
+void off(uint8_t* t) { mode(t, 0x05); }
+void mask(uint8_t* p, uint16_t m) { p[0] = m; p[1] = m >> 8; }
 
-/* Tail pack: active zones [pos..9] + 3-bit force per zone. Used by Feedback (0x21) and Vibration (0x26). */
-inline void packTail(uint8_t* p, uint8_t pos, uint8_t strength /*1..8*/) {
-  uint16_t active = 0;
-  uint32_t zones  = 0;
-  uint8_t  v      = (uint8_t)((strength - 1) & 0x07);
-  for (int i = pos; i < 10; i++) {
-    active |= (uint16_t)(1u << i);
-    zones  |= (uint32_t)v << (3 * i);
-  }
-  writeMask(p, active);
-  p[2] = (uint8_t)(zones      );
-  p[3] = (uint8_t)(zones >>  8);
-  p[4] = (uint8_t)(zones >> 16);
-  p[5] = (uint8_t)(zones >> 24);
+/* active zones [from..9] + 3-bit force per zone (Feedback / Vibration) */
+void tail(uint8_t* p, uint8_t from, uint8_t s) {
+  uint16_t act = 0; uint32_t f = 0;
+  for (int i = from; i < 10; i++) { act |= 1u << i; f |= (uint32_t)((s - 1) & 7) << (3 * i); }
+  mask(p, act);
+  memcpy(p + 2, &f, 4);                       /* LE */
+}
+/* Weapon/Machine: a in [lo..hi-1], b in [a+1..hi] */
+uint16_t pairStrict(uint8_t a, uint8_t b, uint8_t lo, uint8_t hi) {
+  a = constrain(a, lo, hi - 1); b = constrain(b, a + 1, hi);
+  return (1u << a) | (1u << b);
+}
+/* Bow/Galloping: same, but a may equal hi (collapses to one bit, matches old wire output) */
+uint16_t pairLoose(uint8_t a, uint8_t b, uint8_t hi) {
+  a = min(a, hi); b = min(b, hi);
+  if (b <= a) b = a < hi ? a + 1 : hi;
+  return (1u << a) | (1u << b);
 }
 
-/* Two-zone bitmask helpers - return (1<<a)|(1<<b) after clamping in-place.
- * Two flavours preserve the existing wire behaviour exactly:
- *   strict(a, b, lo, hi) - a in [lo..hi-1], b in [a+1..hi]   (used by Weapon).
- *   loose (a, b, lo, hi) - a in [lo..hi],   b in [a+1..hi] OR b=a if a==hi
- *                          (used by Bow/Galloping/Machine - matches old code). */
-inline uint16_t pairMaskStrict(uint8_t& a, uint8_t& b, uint8_t lo, uint8_t hi) {
-  if (a < lo)            a = lo;
-  if (a > (uint8_t)(hi-1)) a = (uint8_t)(hi - 1);
-  if (b <= a)            b = (uint8_t)(a + 1);
-  if (b > hi)            b = hi;
-  return (uint16_t)((1u << a) | (1u << b));
+void feedback(uint8_t* t, uint8_t s0, uint8_t sp) {
+  uint8_t s = str(sp);
+  if (!s) return off(t);
+  tail(mode(t, 0x21), pos(s0), s);
 }
-inline uint16_t pairMaskLoose(uint8_t& a, uint8_t& b, uint8_t hi) {
-  if (a > hi)  a = hi;
-  if (b > hi)  b = hi;
-  if (b <= a)  b = (a < hi) ? (uint8_t)(a + 1) : hi;
-  return (uint16_t)((1u << a) | (1u << b));
+void weapon(uint8_t* t, uint8_t s0, uint8_t e0, uint8_t sp) {
+  uint8_t s = str(sp);
+  if (!s) return off(t);
+  uint8_t* p = mode(t, 0x25);
+  mask(p, pairStrict(pos(s0), pos(e0), 2, 8));
+  p[2] = s - 1;
 }
-
-/* ---- Mode builders. Each early-exits to setOff() on invalid params. ---- */
-
-inline void buildFeedback(uint8_t* m, uint8_t* p, uint8_t startPct, uint8_t strengthPct) {
-  uint8_t str = pctToStrength(strengthPct);
-  if (str == 0) { setOff(m, p); return; }
-  setOff(m, p); *m = 0x21;
-  packTail(p, pctToPos(startPct), str);
+void vibration(uint8_t* t, uint8_t s0, uint8_t ap, uint8_t hz) {
+  uint8_t a = str(ap);
+  if (!a || !hz) return off(t);
+  uint8_t* p = mode(t, 0x26);
+  tail(p, pos(s0), a);
+  p[8] = hz;
 }
-
-inline void buildWeapon(uint8_t* m, uint8_t* p, uint8_t startPct, uint8_t endPct, uint8_t strengthPct) {
-  uint8_t str = pctToStrength(strengthPct);
-  if (str == 0) { setOff(m, p); return; }
-  uint8_t a = pctToPos(startPct), b = pctToPos(endPct);
-  setOff(m, p); *m = 0x25;
-  writeMask(p, pairMaskStrict(a, b, 2, 8));
-  p[2] = (uint8_t)(str - 1);
+void bow(uint8_t* t, uint8_t s0, uint8_t e0, uint8_t sp, uint8_t np) {
+  uint8_t s = str(sp), n = str(np);
+  if (!s || !n) return off(t);
+  uint8_t* p = mode(t, 0x22);
+  mask(p, pairLoose(pos(s0), pos(e0), 8));
+  p[2] = ((s - 1) & 7) | (((n - 1) & 7) << 3);
 }
-
-inline void buildVibration(uint8_t* m, uint8_t* p, uint8_t startPct, uint8_t amplitudePct, uint8_t freqHz) {
-  uint8_t amp = pctToStrength(amplitudePct);
-  if (amp == 0 || freqHz == 0) { setOff(m, p); return; }
-  setOff(m, p); *m = 0x26;
-  packTail(p, pctToPos(startPct), amp);
-  p[8] = freqHz;             /* p9 in Nielk1's gist */
+void galloping(uint8_t* t, uint8_t s0, uint8_t e0, uint8_t f1p, uint8_t f2p, uint8_t hz) {
+  if (!hz) return off(t);
+  uint8_t f1 = min<uint8_t>(pos(f1p), 6), f2 = min<uint8_t>(pos(f2p), 7);
+  if (f2 <= f1) f2 = f1 + 1;
+  uint8_t* p = mode(t, 0x23);
+  mask(p, pairLoose(pos(s0), pos(e0), 8));
+  p[2] = (f2 & 7) | ((f1 & 7) << 3);
+  p[3] = hz;
 }
-
-/* Bow (0x22): Weapon + snap-back. p3..p4 = ((str-1)&7) | ((snap-1)&7)<<3. */
-inline void buildBow(uint8_t* m, uint8_t* p, uint8_t startPct, uint8_t endPct, uint8_t strengthPct, uint8_t snapPct) {
-  uint8_t str = pctToStrength(strengthPct), snap = pctToStrength(snapPct);
-  if (str == 0 || snap == 0) { setOff(m, p); return; }
-  uint8_t a = pctToPos(startPct), b = pctToPos(endPct);
-  setOff(m, p); *m = 0x22;
-  writeMask(p, pairMaskLoose(a, b, 8));
-  uint16_t pair = (uint16_t)(((str - 1) & 0x07) | (((snap - 1) & 0x07) << 3));
-  p[2] = (uint8_t)(pair     );
-  p[3] = (uint8_t)(pair >> 8);
+void machine(uint8_t* t, uint8_t s0, uint8_t e0, uint8_t ap, uint8_t bp, uint8_t hz, uint8_t per) {
+  if (!hz) return off(t);
+  uint8_t a = min<uint8_t>(ap, 100) * 7 / 100, b = min<uint8_t>(bp, 100) * 7 / 100;
+  uint8_t* p = mode(t, 0x27);
+  mask(p, pairStrict(pos(s0), pos(e0), 0, 9));
+  p[2] = a | (b << 3);
+  p[3] = hz;
+  p[4] = per;
 }
+}  // namespace
 
-/* Galloping (0x23): rhythmic pulses bounded by [start..end]. p3 = (foot2&7)|(foot1&7)<<3, p4 = freqHz. */
-inline void buildGalloping(uint8_t* m, uint8_t* p, uint8_t startPct, uint8_t endPct, uint8_t foot1Pct, uint8_t foot2Pct, uint8_t freqHz) {
-  if (freqHz == 0) { setOff(m, p); return; }
-  uint8_t a = pctToPos(startPct), b = pctToPos(endPct);
-  uint8_t f1 = pctToPos(foot1Pct), f2 = pctToPos(foot2Pct);
-  setOff(m, p); *m = 0x23;
-  writeMask(p, pairMaskLoose(a, b, 8));
-  if (f1 > 6) f1 = 6;
-  if (f2 > 7) f2 = 7;
-  if (f2 <= f1) f2 = (uint8_t)((f1 < 7) ? f1 + 1 : 7);
-  p[2] = (uint8_t)((f2 & 0x07) | ((f1 & 0x07) << 3));
-  p[3] = freqHz;
-}
+#define L output.leftTrigger
+#define R output.rightTrigger
+ps5Controller& ps5Controller::l2Off()                                                                     { off(L); return *this; }
+ps5Controller& ps5Controller::l2Rigid    (uint8_t s, uint8_t f)                                           { feedback(L, s, f); return *this; }
+ps5Controller& ps5Controller::l2Trigger  (uint8_t s, uint8_t e, uint8_t f)                                { weapon(L, s, e, f); return *this; }
+ps5Controller& ps5Controller::l2Pulse    (uint8_t s, uint8_t f, uint8_t hz)                               { vibration(L, s, f, hz); return *this; }
+ps5Controller& ps5Controller::l2Bow      (uint8_t s, uint8_t e, uint8_t f, uint8_t n)                     { bow(L, s, e, f, n); return *this; }
+ps5Controller& ps5Controller::l2Galloping(uint8_t s, uint8_t e, uint8_t a, uint8_t b, uint8_t hz)         { galloping(L, s, e, a, b, hz); return *this; }
+ps5Controller& ps5Controller::l2Machine  (uint8_t s, uint8_t e, uint8_t a, uint8_t b, uint8_t hz, uint8_t p) { machine(L, s, e, a, b, hz, p); return *this; }
+ps5Controller& ps5Controller::r2Off()                                                                     { off(R); return *this; }
+ps5Controller& ps5Controller::r2Rigid    (uint8_t s, uint8_t f)                                           { feedback(R, s, f); return *this; }
+ps5Controller& ps5Controller::r2Trigger  (uint8_t s, uint8_t e, uint8_t f)                                { weapon(R, s, e, f); return *this; }
+ps5Controller& ps5Controller::r2Pulse    (uint8_t s, uint8_t f, uint8_t hz)                               { vibration(R, s, f, hz); return *this; }
+ps5Controller& ps5Controller::r2Bow      (uint8_t s, uint8_t e, uint8_t f, uint8_t n)                     { bow(R, s, e, f, n); return *this; }
+ps5Controller& ps5Controller::r2Galloping(uint8_t s, uint8_t e, uint8_t a, uint8_t b, uint8_t hz)         { galloping(R, s, e, a, b, hz); return *this; }
+ps5Controller& ps5Controller::r2Machine  (uint8_t s, uint8_t e, uint8_t a, uint8_t b, uint8_t hz, uint8_t p) { machine(R, s, e, a, b, hz, p); return *this; }
+#undef L
+#undef R
 
-/* Machine (0x27): bounded vibration oscillating between two amplitudes.
- * p3 = (ampA&7) | (ampB&7)<<3 (RAW 0..7, no -1). p4 = freqHz, p5 = period in 0.1s. */
-inline void buildMachine(uint8_t* m, uint8_t* p, uint8_t startPct, uint8_t endPct, uint8_t ampAPct, uint8_t ampBPct, uint8_t freqHz, uint8_t periodTenths) {
-  if (freqHz == 0) { setOff(m, p); return; }
-  uint8_t a = pctToPos(startPct), b = pctToPos(endPct);
-  uint8_t ampA = (uint8_t)((ampAPct > 100 ? 100 : ampAPct) * 7 / 100);
-  uint8_t ampB = (uint8_t)((ampBPct > 100 ? 100 : ampBPct) * 7 / 100);
-  setOff(m, p); *m = 0x27;
-  writeMask(p, pairMaskStrict(a, b, 0, 9));
-  p[2] = (uint8_t)((ampA & 0x07) | ((ampB & 0x07) << 3));
-  p[3] = freqHz;
-  p[4] = periodTenths;
-}
-} // namespace
-
-/* Adaptive trigger setters. All take percent units (0..100) for positions
- * and strengths. Each call REPLACES the trigger's current effect (only one
- * mode per trigger per frame). L2 and R2 are independent - you can mix
- * different modes on each. Stages into output; call send().
- *   *Off()       - free trigger, no resistance.
- *   *Rigid()     - solid wall from `start` onwards at `strength`.
- *   *Trigger()   - sharp break between `start` and `end` zones.
- *   *Pulse()     - vibration pulses at `freqHz` between zones.
- *   *Bow()       - Trigger + extra snap-back (combo).
- *   *Galloping() - rhythmic pulses bounded by zones (combo).
- *   *Machine()   - Trigger range + Pulse oscillating between two amps. */
-ps5Controller& ps5Controller::l2Off()                                                    { setOff        (&output.leftTriggerMode, output.leftTriggerParam); return *this; }
-ps5Controller& ps5Controller::l2Rigid  (uint8_t s, uint8_t f)                            { buildFeedback (&output.leftTriggerMode, output.leftTriggerParam, s, f); return *this; }
-ps5Controller& ps5Controller::l2Trigger(uint8_t s, uint8_t e, uint8_t f)                 { buildWeapon   (&output.leftTriggerMode, output.leftTriggerParam, s, e, f); return *this; }
-ps5Controller& ps5Controller::l2Pulse  (uint8_t s, uint8_t f, uint8_t hz)                { buildVibration(&output.leftTriggerMode, output.leftTriggerParam, s, f, hz); return *this; }
-ps5Controller& ps5Controller::l2Bow      (uint8_t s, uint8_t e, uint8_t f, uint8_t sn)                                          { buildBow      (&output.leftTriggerMode,  output.leftTriggerParam,  s, e, f, sn); return *this; }
-ps5Controller& ps5Controller::l2Galloping(uint8_t s, uint8_t e, uint8_t f1, uint8_t f2, uint8_t hz)                             { buildGalloping(&output.leftTriggerMode,  output.leftTriggerParam,  s, e, f1, f2, hz); return *this; }
-ps5Controller& ps5Controller::l2Machine  (uint8_t s, uint8_t e, uint8_t aA, uint8_t aB, uint8_t hz, uint8_t per)                { buildMachine  (&output.leftTriggerMode,  output.leftTriggerParam,  s, e, aA, aB, hz, per); return *this; }
-ps5Controller& ps5Controller::r2Off()                                                    { setOff        (&output.rightTriggerMode, output.rightTriggerParam); return *this; }
-ps5Controller& ps5Controller::r2Rigid  (uint8_t s, uint8_t f)                            { buildFeedback (&output.rightTriggerMode, output.rightTriggerParam, s, f); return *this; }
-ps5Controller& ps5Controller::r2Trigger(uint8_t s, uint8_t e, uint8_t f)                 { buildWeapon   (&output.rightTriggerMode, output.rightTriggerParam, s, e, f); return *this; }
-ps5Controller& ps5Controller::r2Pulse  (uint8_t s, uint8_t f, uint8_t hz)                { buildVibration(&output.rightTriggerMode, output.rightTriggerParam, s, f, hz); return *this; }
-ps5Controller& ps5Controller::r2Bow      (uint8_t s, uint8_t e, uint8_t f, uint8_t sn)                                          { buildBow      (&output.rightTriggerMode, output.rightTriggerParam, s, e, f, sn); return *this; }
-ps5Controller& ps5Controller::r2Galloping(uint8_t s, uint8_t e, uint8_t f1, uint8_t f2, uint8_t hz)                             { buildGalloping(&output.rightTriggerMode, output.rightTriggerParam, s, e, f1, f2, hz); return *this; }
-ps5Controller& ps5Controller::r2Machine  (uint8_t s, uint8_t e, uint8_t aA, uint8_t aB, uint8_t hz, uint8_t per)                { buildMachine  (&output.rightTriggerMode, output.rightTriggerParam, s, e, aA, aB, hz, per); return *this; }
-
-#if !defined(NO_GLOBAL_INSTANCES)
+#ifndef NO_GLOBAL_INSTANCES
 ps5Controller ps5;
 #endif
