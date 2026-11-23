@@ -7,7 +7,7 @@
 /* ============================================================ output */
 
 enum {                           /* wire offsets, byte 0 = 0xA2 HID header (CRC'd) */
-  O_SEQ = 2, O_TAG, O_VF0, O_VF1, O_MOTOR_R, O_MOTOR_L,
+  O_VF0 = 4, O_VF1, O_MOTOR_R, O_MOTOR_L,
   O_MUTE_LED = 12, O_POWER_SAVE, O_R2 = 14, O_L2 = 25,
   O_VF2 = 42, O_BRIGHTNESS = 46, O_PLAYER, O_RGB,
   O_LEN = 79
@@ -20,44 +20,44 @@ static void sendCrc(uint8_t* d, uint8_t len) {
   ps5_l2cap_send(false, d, len);
 }
 
-/* The pad plays its own connect animation until its sensor clock reaches this
- * (~3.4 s after power-on; SDL's constant). LED writes before it are ignored or glitch. */
-bool ps5_leds_ready() { return ps5.sensorTime >= 10200000; }
-
-void ps5_send_output(bool resetLeds) {
-  static uint8_t seq = 0;
+/* SDL-style 0x31 frame. Seq nibble stays 0 (SDL never sets it).
+ *   ready: pad's connect animation is over -> triggers, mute LED, mic power-save, brightness.
+ *          Before that only rumble goes out (anything else during the animation glitches it).
+ *   leds:  lightbar + player LEDs (false while handed to the firmware). */
+void ps5_send_output(bool ready, bool leds) {
   const ps5Controller::Out& o = ps5.output;
-  if (resetLeds) {                             /* SDL: a frame with ONLY "reset LEDs", then colours */
-    uint8_t r[O_LEN] = {0xA2, 0x31, (uint8_t)(seq++ << 4), 0x10, 0x00, 0x08};
-    sendCrc(r, O_LEN);
+  bool snd = ps5.isPlaying();                  /* melody owns the actuators via 0x32 */
+  uint8_t mr = snd ? 0 : o.smallRumble, ml = snd ? 0 : o.largeRumble;
+  uint8_t d[O_LEN] = {0xA2, 0x31, 0x00, 0x10};
+  /* Rumble emulation (0x01) + "disable audio haptics" (0x02) only while motors run (SDL). */
+  d[O_VF0] = (mr || ml) ? 0x03 : 0x00;
+  d[O_MOTOR_R] = mr;
+  d[O_MOTOR_L] = ml;
+  if (ready) {
+    d[O_VF0] |= 0x0C;                          /* R2 + L2 adaptive triggers */
+    d[O_VF1]  = 0x01;                          /* mute LED */
+    d[O_VF2]  = 0x01;                          /* player-LED brightness */
+    if (o.micMute) { d[O_VF1] |= 0x02; d[O_POWER_SAVE] = 0x10; }   /* power-save: mic off */
+    d[O_MUTE_LED]   = o.muteLed;
+    memcpy(d + O_R2, o.rightTrigger, 11);
+    memcpy(d + O_L2, o.leftTrigger, 11);
+    d[O_BRIGHTNESS] = min<uint8_t>(o.ledBrightness, 2);
   }
-  uint8_t d[O_LEN] = {0xA2, 0x31};
-  d[O_SEQ] = seq++ << 4;
-  d[O_TAG] = 0x10;
-  /* compatible vibration | haptics select (= rumble emulation) | R2 | L2 trigger.
-   * While a melody plays, drop haptics select so the 0x32 PCM stream drives the actuators. */
-  bool snd = ps5.isPlaying();
-  d[O_VF0] = snd ? 0x0D : 0x0F;
-  d[O_VF1] = ps5_leds_ready() ? 0x15 : 0x01;   /* mute LED | lightbar | player LEDs */
-  d[O_VF2] = 0x01;                             /* LED brightness */
-  if (o.micMute) { d[O_VF1] |= 0x02; d[O_POWER_SAVE] = 0x10; }   /* power-save: mic off */
-  d[O_MOTOR_R]     = snd ? 0 : o.smallRumble;
-  d[O_MOTOR_L]     = snd ? 0 : o.largeRumble;
-  d[O_MUTE_LED]    = o.muteLed;
-  memcpy(d + O_R2, o.rightTrigger, 11);
-  memcpy(d + O_L2, o.leftTrigger, 11);
-  d[O_BRIGHTNESS]  = min<uint8_t>(o.ledBrightness, 2);
-  d[O_PLAYER]      = o.playerLeds & 0x1F;
-  d[O_RGB]         = o.r;
-  d[O_RGB + 1]     = o.g;
-  d[O_RGB + 2]     = o.b;
+  if (leds) {
+    d[O_VF1]       |= 0x14;                    /* lightbar + player LEDs */
+    d[O_PLAYER]     = (o.playerLeds & 0x1F) | 0x20;   /* 0x20: change instantly, no fade */
+    d[O_RGB]        = o.r;
+    d[O_RGB + 1]    = o.g;
+    d[O_RGB + 2]    = o.b;
+  }
   sendCrc(d, O_LEN);
 }
 
-/* SET_REPORT(FEATURE 0xF4) on the control channel: legacy "start full reports" kick. */
-void ps5_send_enable() {
-  static const uint8_t en[] = {0x53, 0xF4, 0x43, 0x02};
-  ps5_l2cap_send(true, en, sizeof(en));
+/* "Reset LED state" alone (valid_flag1 bit 3, nothing else): hands LEDs between firmware
+ * and host. SDL sends it once after the connect animation, then the colour frame. */
+void ps5_send_reset() {
+  uint8_t d[O_LEN] = {0xA2, 0x31, 0x00, 0x10, 0x00, 0x08};
+  sendCrc(d, O_LEN);
 }
 
 /* Report 0x32 HD haptics (SAxense layout, MPL-2.0 reference): sub-packet 0x11 config,

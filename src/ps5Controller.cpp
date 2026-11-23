@@ -1,5 +1,9 @@
-/* ps5Controller.cpp - BT bring-up, async scan/connect/reconnect, output setters.
- * All DualSense byte work lives in ps5_bytes.cpp; L2CAP in bluedroid/. */
+/* ps5Controller.cpp - BT bring-up, async scan/connect/reconnect, output scheduling, sound.
+ * All DualSense byte work lives in ps5_bytes.cpp; L2CAP in bluedroid/.
+ *
+ * Threading: frames are sent from the Bluetooth task (link/input callbacks), never from
+ * loop(): send() only marks output dirty. The esp_timer tick only scans/pages/kicks while
+ * no input is flowing. Nothing here blocks. */
 #include "ps5Controller.h"
 
 #include <esp_bt.h>
@@ -16,17 +20,62 @@
 static volatile bool g_active   = false;   /* input reports flowing */
 static volatile bool g_scanning = false;
 static volatile bool g_found    = false;
+static volatile bool g_dirty    = false;   /* send() requested a frame */
+static volatile bool g_playing  = false;
+static volatile uint32_t g_lastInput = 0;  /* millis() of the last report */
+static bool g_ledsReady = false;           /* pad's connect animation done (BT task only) */
+static bool g_released  = false;           /* LEDs handed to firmware (BT task only) */
 static esp_bd_addr_t g_foundMac;
+
+/* ============================================================ sound (BT task, every 10.667 ms) */
+
+static const ps5Controller::Note* g_notes;
+static size_t   g_left;
+static ps5Controller::Note g_one;            /* storage for tone() */
+static uint32_t g_phase, g_step, g_noteLeft;  /* DDS phase, phase step, samples left in note */
+static int8_t   g_amp;
+
+static int8_t wave(uint32_t ph, int a) { return (ph & 0x80000000u) ? a : -a; }
+static int8_t clip(int v) { return constrain(v, -127, 127); }
+
+/* 32 stereo samples at 3 kHz per 0x32 report. Haptics mode disables firmware rumble,
+ * so rumble is mixed in as low square waves (left 40 Hz, right 120 Hz). */
+static void soundStep() {
+  static int64_t next = 0;
+  static uint32_t rl, rr;
+  if (!g_playing) return;
+  int64_t now = esp_timer_get_time();
+  if (now < next) return;
+  next = now - next > 50000 ? now + 10667 : next + 10667;   /* keep cadence, no burst after gaps */
+  int8_t s[64] = {};
+  int lA = ps5.output.largeRumble >> 1, rA = ps5.output.smallRumble >> 1;
+  for (int i = 0; i < 64; i += 2) {
+    s[i]     = wave(rl += 57266230u, lA);      /* 2^32 * 40 / 3000 */
+    s[i + 1] = wave(rr += 171798692u, rA);     /* 2^32 * 120 / 3000 */
+    while (!g_noteLeft && g_left) {
+      g_step = (uint32_t)(((uint64_t)g_notes->hz << 32) / 3000);
+      g_noteLeft = g_notes->ms * 3u;           /* 3 samples per ms */
+      g_notes++; g_left--;
+    }
+    if (!g_noteLeft) { g_playing = false; break; }   /* rest of the frame stays silent */
+    int8_t m = g_step ? wave(g_phase, g_amp) : 0;
+    s[i] = clip(s[i] + m); s[i + 1] = clip(s[i + 1] + m);
+    g_phase += g_step;
+    g_noteLeft--;
+  }
+  ps5_send_haptics(s);
+}
 
 /* ============================================================ link events (BT task) */
 
 void ps5_on_link(bool up) {
+  g_ledsReady = g_released = false;
   if (up) {                                   /* first input report flips g_active */
     esp_bt_gap_cancel_discovery();            /* inbound reconnect may land mid-scan */
-    ps5_send_enable();
-    ps5_send_output();                        /* starts the 0x31 stream right away */
+    ps5_send_output(false, false);            /* an output report starts the 0x31 stream */
     return;
   }
+  g_playing = false;
   bool was = g_active;
   g_active = false;
   if (was && ps5.onDisconnect) ps5.onDisconnect();
@@ -35,11 +84,26 @@ void ps5_on_link(bool up) {
 void ps5_on_input(const uint8_t* p, uint16_t len) {
   /* First report: no edges, the user is usually still holding the pair gesture. */
   if (!ps5_parse(p, len, g_active)) return;
-  static bool leds = false;                   /* pad connect animation finished? */
-  bool ready = ps5_leds_ready();
-  if (!g_active) log_i("first report: sensorTime=%u", ps5.sensorTime);   /* DEBUG */
-  if (ready != leds) { leds = ready; log_i("leds ready=%d sensorTime=%u", ready, ps5.sensorTime); if (ready) ps5_send_output(true); }   /* reset LEDs once + push colours */
+  uint32_t now = millis();
+  g_lastInput = now;
   if (!g_active) { g_active = true; if (ps5.onConnect) ps5.onConnect(); }
+
+  /* LEDs, SDL order: wait out the pad's connect animation (sensor clock >= 10200000,
+   * ~3.4 s after power-on), send ONE reset-only frame, then colours. Same reset when
+   * handing LEDs to / back from the firmware (releaseLeds). */
+  if (!g_ledsReady && ps5.sensorTime >= 10200000) {
+    ps5_send_reset(); g_ledsReady = true; g_dirty = true;
+  }
+  if (g_ledsReady && g_released != ps5.output.releaseLeds) {
+    g_released = ps5.output.releaseLeds; ps5_send_reset(); g_dirty = true;
+  }
+
+  static uint32_t lastTx = 0;                 /* send() is rate-limited here to 10 ms */
+  if (g_dirty && now - lastTx >= 10) {
+    g_dirty = false; lastTx = now;
+    ps5_send_output(g_ledsReady, g_ledsReady && !g_released);
+  }
+  soundStep();
   if (ps5.onPacket) ps5.onPacket();
 }
 
@@ -80,68 +144,22 @@ static void startScan() {
   g_scanning = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 4, 0) == ESP_OK;
 }
 
-/* ============================================================ background tick (esp_timer task) */
+/* ============================================================ background tick (esp_timer, 400 ms) */
 
 static void tick(void*) {
   static uint8_t n = 0;
-  if (g_active) return;
-  if (ps5_l2cap_up()) { ps5_send_output(); return; }  /* channels up, no input yet: kick */
-  if (g_scanning || !ps5_l2cap_idle() || ++n < 12) return;   /* retry every ~5 s */
+  if (g_active) {                             /* stalled stream (no report for 1 s): kick */
+    if (millis() - g_lastInput > 1000) ps5_send_output(false, false);
+    return;
+  }
+  if (ps5_l2cap_up()) { ps5_send_output(false, false); return; }   /* up, no input yet: kick */
+  if (g_scanning || !ps5_l2cap_idle() || ++n < 12) return;          /* retry every ~5 s */
   n = 0;
   /* Alternate: page the known pad / inquire (finds a pad in pairing mode, e.g. re-pair). */
   static bool page = false;
   if (ps5_l2cap_target(nullptr) && (page = !page)) ps5_l2cap_connect(nullptr);
   else                                             startScan();
 }
-
-/* ============================================================ sound (esp_timer, every 10.667 ms) */
-
-static esp_timer_handle_t g_snd;
-static const ps5Controller::Note* g_notes;
-static size_t   g_left;
-static ps5Controller::Note g_one;            /* storage for tone() */
-static uint32_t g_phase, g_step, g_noteLeft;  /* DDS phase, phase step, samples left in note */
-static int8_t   g_amp;
-static uint32_t g_rl, g_rr;                   /* rumble phases (left 40 Hz, right 120 Hz) */
-static volatile bool g_playing = false;
-
-static int8_t wave(uint32_t ph, int a) { return (ph & 0x80000000u) ? a : -a; }
-static int8_t clip(int v) { return constrain(v, -127, 127); }
-
-static void soundTick(void*) {
-  int8_t s[64] = {};
-  /* Haptics mode turns off firmware rumble, so mix rumble into the PCM ourselves. */
-  int lA = ps5.output.largeRumble >> 1, rA = ps5.output.smallRumble >> 1;
-  for (int i = 0; i < 64 && g_active; i += 2) {
-    s[i]     = clip(wave(g_rl += 57266230u, lA));        /* 2^32 * 40 / 3000 */
-    s[i + 1] = clip(wave(g_rr += 171798692u, rA));       /* 2^32 * 120 / 3000 */
-    while (!g_noteLeft) {
-      if (!g_left) { esp_timer_stop(g_snd); g_playing = false; break; }
-      g_step = (uint32_t)(((uint64_t)g_notes->hz << 32) / 3000);
-      g_noteLeft = g_notes->ms * 3u;           /* 3 samples per ms */
-      g_notes++; g_left--;
-    }
-    if (!g_playing) break;
-    int8_t m = g_step ? wave(g_phase, g_amp) : 0;
-    s[i] = clip(s[i] + m); s[i + 1] = clip(s[i + 1] + m);
-    g_phase += g_step;
-    g_noteLeft--;
-  }
-  if (!g_active) { esp_timer_stop(g_snd); g_playing = false; return; }
-  ps5_send_haptics(s);                        /* last frame is padded with silence */
-}
-
-void ps5Controller::play(const Note* notes, size_t count, uint8_t volume) {
-  stopSound();
-  if (!g_snd || !g_active || !notes || !count) return;
-  g_notes = notes; g_left = count; g_noteLeft = 0; g_phase = 0;
-  g_amp = min<uint8_t>(volume, 100) * 127 / 100;
-  g_playing = true;
-  esp_timer_start_periodic(g_snd, 10667);
-}
-void ps5Controller::tone(uint16_t hz, uint16_t ms, uint8_t volume) { stopSound(); g_one = {hz, ms}; play(&g_one, 1, volume); }
-void ps5Controller::stopSound() { if (g_snd) esp_timer_stop(g_snd); g_playing = false; }
-bool ps5Controller::isPlaying() const { return g_playing; }
 
 static bool bringUp() {
   static bool done = false;
@@ -155,8 +173,6 @@ static bool bringUp() {
   const esp_timer_create_args_t args = { .callback = tick, .name = "ps5" };
   esp_timer_handle_t t;
   if (esp_timer_create(&args, &t) != ESP_OK || esp_timer_start_periodic(t, 400000) != ESP_OK) return false;
-  const esp_timer_create_args_t snd = { .callback = soundTick, .name = "ps5snd" };
-  if (esp_timer_create(&snd, &g_snd) != ESP_OK) return false;
   return done = true;
 }
 
@@ -192,9 +208,21 @@ void ps5Controller::forget() {                /* unpair: drop target + link key 
 
 ps5Controller& ps5Controller::lightbar(uint8_t r, uint8_t g, uint8_t b) { output.r = r; output.g = g; output.b = b; return *this; }
 ps5Controller& ps5Controller::rumble(uint8_t s, uint8_t l) { output.smallRumble = s; output.largeRumble = l; return *this; }
-ps5Controller& ps5Controller::muteLed(uint8_t m)  { output.muteLed = m; return *this; }
-ps5Controller& ps5Controller::micMute(bool on)    { output.micMute = on; return *this; }
-ps5Controller& ps5Controller::send()              { if (g_active) ps5_send_output(); return *this; }
+ps5Controller& ps5Controller::muteLed(uint8_t m)     { output.muteLed = m; return *this; }
+ps5Controller& ps5Controller::micMute(bool on)       { output.micMute = on; return *this; }
+ps5Controller& ps5Controller::releaseLeds(bool on)   { output.releaseLeds = on; return *this; }
+ps5Controller& ps5Controller::send()                 { g_dirty = true; return *this; }
+
+void ps5Controller::play(const Note* notes, size_t count, uint8_t volume) {
+  g_playing = false;
+  if (!notes || !count) return;
+  g_notes = notes; g_left = count; g_noteLeft = 0; g_phase = 0;
+  g_amp = min<uint8_t>(volume, 100) * 127 / 100;
+  g_playing = true;                           /* BT task picks it up on the next report */
+}
+void ps5Controller::tone(uint16_t hz, uint16_t ms, uint8_t volume) { g_playing = false; g_one = {hz, ms}; play(&g_one, 1, volume); }
+void ps5Controller::stopSound()       { g_playing = false; }
+bool ps5Controller::isPlaying() const { return g_playing; }
 
 ps5Controller& ps5Controller::playerLed(uint8_t index, uint8_t value) {
   if (index < 1 || index > 5) return *this;

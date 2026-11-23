@@ -1,142 +1,99 @@
-# esp-ps5 — How the system works
+# esp-ps5 — agent notes
 
-Arduino library: an ESP32 acts as a Bluetooth Classic HID host for a PS5
-DualSense. Input lands in flat public fields on the global `ps5`; output is
-staged in `ps5.output` and sent with `ps5.send()`. Protocol verified against
-Linux `drivers/hid/hid-playstation.c`.
+ESP32 as a Bluetooth Classic HID host for a PS5 DualSense (raw Bluedroid L2CAP).
+Protocol cross-checked against Linux `hid-playstation.c`, SDL `SDL_hidapi_ps5.c`, Bluepad32, SAxense.
 
-## File layout
+## Files
 
 ```
-src/ps5Controller.h      public API + the internal glue declarations
-src/ps5Controller.cpp    BT bring-up, async scan/connect/reconnect (GAP cb + esp_timer),
-                         output setters, adaptive-trigger encoders
-src/ps5_bytes.cpp        ALL byte work: 0x31 input parser, 0x31 output builder (ROM CRC32)
-src/bluedroid/           L2CAP transport (PSM 0x11 + 0x13) + hand-declared Bluedroid internals
+src/ps5Controller.h      public API + internal glue declarations
+src/ps5Controller.cpp    bring-up, async scan/connect, output scheduling, LED gate, sound, trigger encoders
+src/ps5_bytes.cpp        all byte work: 0x31 parse, 0x31 / reset / 0x32 builders, ROM CRC32
+src/bluedroid/           L2CAP transport (PSM 0x11 + 0x13), page scan, hand-declared Bluedroid internals
 ```
 
-## Connection flow (fully async; nothing blocks loop())
+## Flow (nothing blocks; frames go out from the Bluetooth task)
 
-1. `begin(secs)` brings up BT controller + Bluedroid, registers the GAP callback,
-   sets connectable mode, registers HID PSMs, starts a 400 ms `esp_timer`, then
-   starts a GAP inquiry (or connects to the latched MAC) and returns (~0.5 s).
-2. GAP `DISC_RES` with name "DualSense" / "Wireless Controller" → latch MAC,
-   cancel inquiry. On `DISC_STATE_CHANGED: STOPPED` → `ps5_l2cap_connect(mac)`.
-3. Both L2CAP channels configured → `ps5_on_link(true)` → `ps5_send_enable()`
-   (SET_REPORT feature 0xF4 on control).
-4. Timer tick (esp_timer task), only while no input yet:
-   - channels up → send a full output report every 400 ms (Bluepad32: an output
-     report enables input 0x31; fixes the "channels up but silent" stall);
-   - link fully idle → every ~5 s reconnect to the latched MAC, else rescan.
-5. First valid 0x31 report → `g_active = true`, `onConnect`; every report → `onPacket`.
-   The first report is parsed without edges (user is still holding PS+Create).
-6. `isConnected()` just returns `g_active`.
+1. `begin()`: BT + Bluedroid up, GAP callback, fast interlaced page scan (11.25 ms / 40 ms),
+   page timeout 1.28 s, 400 ms `esp_timer` tick. Bonded pad in Bluedroid NVS → page it; else 5 s inquiry.
+2. Tick, while not connected: every ~5 s alternate paging the known pad / inquiry (inquiry finds a pad
+   in pairing mode). Inbound reconnect (pad's PS press pages us) needs page scan, so inquiries stay short.
+3. Both channels configured → non-connectable, `ps5_on_link(true)` → one output frame (starts 0x31 input).
+4. Every input report (`ps5_on_input`, BT task): parse → LED gate → send pending output (≤ every 10 ms)
+   → haptics frame if a melody is due. `send()` only sets a dirty flag.
+5. LED gate (SDL): pad plays its connect animation until its sensor clock ≥ 10200000 (0.33 µs ticks,
+   ~3.4 s after pad power-on). Before that, frames carry rumble only. Then one reset-only frame
+   (VF1 bit 3), latch ready, then full frames. Same reset when `releaseLeds` toggles.
+6. Tick while connected: no report for 1 s → kick an output frame.
 
-`begin("AA:BB:..")` latches the MAC and connects; also returns immediately.
-
-## DualSense Bluetooth wire format
-
-### OUTPUT report (host → controller, 79 bytes, interrupt PSM 0x13)
+## OUTPUT 0x31 (79 bytes incl. 0xA2 header, interrupt PSM)
 
 | Offset | Field |
 |---|---|
-| 0 | `0xA2` HID DATA\|OUTPUT header (covered by CRC) |
-| 1 | `0x31` report ID |
-| 2 | seq tag (high nibble = sequence) |
-| 3 | `0x10` DualSense BT tag (mandatory) |
-| 4 | valid_flag0 = `0x0F`: compatible vibration, haptics select, R2, L2 trigger |
-| 5 | valid_flag1 = `0x15`: mute LED, lightbar, player LEDs (+`0x02` power save, +`0x08` release LEDs) |
-| 6 / 7 | motor_right (small) / motor_left (large) |
-| 12 | mute LED (0 off, 1 solid, 2 pulse) |
+| 0 | `0xA2` HIDP DATA\|OUTPUT (covered by CRC) |
+| 1 | `0x31` |
+| 2 | seq tag, kept 0 (SDL) |
+| 3 | `0x10` |
+| 4 | valid_flag0: 0x01 rumble emulation + 0x02 disable audio haptics (only while motors ≠ 0), 0x04 R2, 0x08 L2 |
+| 5 | valid_flag1: 0x01 mute LED, 0x02 power save, 0x04 lightbar, 0x08 reset LEDs, 0x10 player LEDs |
+| 6 / 7 | motor right (small) / left (large) |
+| 12 | mute LED 0 off, 1 solid, 2 pulse |
 | 13 | power save: bit 4 = mic hardware mute |
-| 14..24 | R2 trigger block: mode + 10 params |
-| 25..35 | L2 trigger block: mode + 10 params |
-| 42 | valid_flag2 = `0x03`: LED brightness, lightbar setup |
-| 45 | lightbar setup = `0x02` LIGHT_OUT (cancels the boot blue fade) |
-| 46 | player LED brightness (0 bright, 1 mid, 2 dim) |
-| 47 | player LED mask (5 bits) |
+| 14..24 / 25..35 | R2 / L2 trigger block: mode + 10 params |
+| 42 | valid_flag2: 0x01 player-LED brightness (0x02 lightbar setup: unused, LIGHT_OUT = 3 s fade) |
+| 46 | brightness 0 bright, 1 mid, 2 dim |
+| 47 | player LEDs (5 bits) \| 0x20 instant change |
 | 48..50 | lightbar R, G, B |
-| 75..78 | CRC32 LE over bytes 0..74 (zlib; `esp_rom_crc32_le(0, ...)`) |
+| 75..78 | CRC32 LE over 0..74 (zlib; `esp_rom_crc32_le(0, …)`) |
 
-Don't `send()` faster than ~10 ms. `releaseLeds()` hands LEDs to firmware: send it
-once, then stop sending output reports (continued output after RELEASE_LEDS makes
-the firmware drop the link — the kernel defines the bit but never sets it).
+Reset-only frame: header + `0x10`, VF0 0, VF1 `0x08`, rest 0.
 
-### Adaptive trigger modes (Nielk1 spec; deprecated 0x01/0x02/0x06 are NOT used)
+## HAPTICS 0x32 (143 bytes incl. 0xA2, SAxense layout)
+
+`A2 32 00 91 07 FE 00 00 00 00 FF <ctr> 92 40` + 64 × int8 (32 stereo L/R samples, 3 kHz) + zeros + CRC32
+over 0..138 at 139..142. Every 10.667 ms. Plays only while VF0 0x02 is clear (no firmware rumble).
+Speaker = report 0x36 with 200-byte Opus frames (48 kHz) — not implemented (needs libopus).
+
+## Adaptive trigger modes (Nielk1; deprecated 0x01/0x02/0x06 not used)
 
 | Mode | Setter | Params |
 |---|---|---|
-| `0x05` Off | `l2Off()` | all 0 |
-| `0x21` Feedback | `l2Rigid(start, str)` | p0..1 zone mask [pos..9], p2..5 3-bit force per zone `(str-1)&7` |
-| `0x25` Weapon | `l2Trigger(start, end, str)` | p0..1 `(1<<a)\|(1<<b)` a∈[2..7] b∈[a+1..8], p2 `str-1` |
-| `0x26` Vibration | `l2Pulse(start, amp, hz)` | as Feedback, p8 = Hz |
-| `0x22` Bow | `l2Bow(start, end, str, snap)` | p0..1 mask, p2 `(str-1)\|(snap-1)<<3` |
-| `0x23` Galloping | `l2Galloping(start, end, f1, f2, hz)` | p0..1 mask, p2 `f2\|f1<<3` (f1≤6, f2>f1), p3 Hz |
-| `0x27` Machine | `l2Machine(start, end, ampA, ampB, hz, per)` | p0..1 mask, p2 `a\|b<<3` (raw 0..7), p3 Hz, p4 period (0.1 s) |
+| 0x05 Off | `l2Off()` | 0 |
+| 0x21 Feedback | `l2Rigid(start, str)` | p0..1 zone mask [pos..9], p2..5 3-bit force per zone `(str-1)&7` |
+| 0x25 Weapon | `l2Trigger(start, end, str)` | p0..1 `(1<<a)\|(1<<b)` a∈[2..7] b∈[a+1..8], p2 `str-1` |
+| 0x26 Vibration | `l2Pulse(start, amp, hz)` | as Feedback, p8 Hz |
+| 0x22 Bow | `l2Bow(start, end, str, snap)` | mask, p2 `(str-1)\|(snap-1)<<3` |
+| 0x23 Galloping | `l2Galloping(start, end, f1, f2, hz)` | mask, p2 `f2\|f1<<3` (f1≤6, f2>f1), p3 Hz |
+| 0x27 Machine | `l2Machine(start, end, a, b, hz, per)` | mask, p2 `a\|b<<3` (raw 0..7), p3 Hz, p4 period 0.1 s |
 
-Percent → zone `pos = (pct*9+50)/100`, strength `(pct*8+50)/100` (0 → Off).
-One block per trigger per frame; L2 and R2 are independent.
+Percent → zone `(pct*9+50)/100`, strength `(pct*8+50)/100` (0 → Off).
 
-### INPUT report (controller → host, 78 bytes after the `0xA1` header)
+## INPUT 0x31 (78 bytes after the 0xA1 header)
 
 | Offset | Field |
 |---|---|
-| 0 | `0x31` (anything else, e.g. the short `0x01` report, is ignored) |
-| 2..5 | LX, LY, RX, RY (128 center; Y up = low) → `raw - 128` |
-| 6 / 7 | L2 / R2 analog |
-| 9 | low nibble hat (0..7 N..NW, 8 neutral), high nibble □ ✕ ○ △ |
+| 0 | `0x31` (other reports, e.g. short 0x01, are ignored) |
+| 2..5 | LX LY RX RY, 128 centre → `raw-128`, deadzone applied |
+| 6 / 7 | L2 / R2 |
+| 9 | hat low nibble (0..7 N..NW, 8 neutral), □ ✕ ○ △ high nibble |
 | 10 | L1 R1 L2 R2 Create Options L3 R3 |
 | 11 | PS, touchpad, mute |
-| 17..22 / 23..28 | gyro / accel xyz, le16 |
-| 29..32 | sensor timestamp le32 (0.33 µs) |
-| 34..41 | 2 touch contacts: `[id\|inactive<<7][x lo][x hi\|y lo<<4][y hi]` |
-| 54 | battery 0..10 (low) + charging nibble (1 chg, 2 full, A/B/F error) |
+| 17..22 / 23..28 | gyro / accel xyz le16 |
+| 29..32 | sensor clock le32, 0.33 µs (LED gate; wraps ~24 min) |
+| 34..41 | touch ×2: `[id\|inactive<<7][x lo][x hi\|y lo<<4][y hi]` |
+| 54 | battery 0..10 + charging nibble (1 chg, 2 full, A/B/F error) |
 | 55 | headphones, mic jack, mic muted |
-| 74..77 | CRC32 (not verified) |
 
-Unused but known: audio volume/routing bytes 8..11 + 41 (needs a BT audio profile
-to be useful), vibration v2 (VF2 bit 2, fw ≥ 2.21), feature reports 0x05
-(motion calibration), 0x09 (pairing), 0x20 (firmware). Inspect new firmware
-bytes via `ps5.latestPacket`.
+## Don't regress
 
-## Pairing
+- Core ≥ 3.3.9 / 4.x: include `esp32-hal-alloc-bt-classic-mem.h` or `btStart()` fails (issue #2).
+- IDF 6.x `tL2CAP_APPL_INFO` may have one more trailing pointer: keep the null slot.
+- Bluedroid reports disconnects per channel: clear only that CID; link-down only on the up→down edge.
+- No CONNECT_REQ unless both CIDs are 0; failed outbound connect clears the control CID.
+- LEDs: no writes during the connect animation, reset-only frame first, never LIGHT_OUT every frame,
+  never RELEASE (reset) in every frame (the pad drops the link).
+- TX buffer is `sizeof(BT_HDR) + 13 + len`, not Bluedroid's 4 KB default. `latestPacket` is a copy.
 
-The DualSense pairs with PS + Create. Bluedroid stores the link key in its own
-NVS, so pairing survives reboots. The target MAC is RAM-only: after a reboot
-`begin()` rescans; within a boot it reconnects to the latched MAC. `forget()`
-drops it so the next retry rescans.
+## Rough edges
 
-## Design decisions (don't regress)
-
-- **Core ≥ 3.3.9 / 4.x**: include `esp32-hal-alloc-bt-classic-mem.h` or
-  `initArduino()` frees Classic-BT RAM and `btStart()` fails.
-- **IDF 6.x** `tL2CAP_APPL_INFO` may have an extra trailing pointer; our struct
-  carries a null slot for it.
-- **Per-channel disconnect**: Bluedroid reports each channel separately; clear
-  only that channel's CID, fire link-down only on the up→down edge (else TX freezes
-  after a one-channel blip).
-- **No CONNECT_REQ on a half-open link**: retry only when both CIDs are 0. A failed
-  outbound connect (`connect_cfm` ≠ OK) clears the control CID so retries continue.
-- **Ignore non-0x31 reports**, otherwise `g_active` latches on the short 0x01
-  report and the enable kick stops.
-- **TX buffer** is `sizeof(BT_HDR) + 13 + len` (~100 B), not Bluedroid's 4 KB default.
-- **latestPacket is a copy**: Bluedroid frees the RX buffer after the callback.
-- Mic hardware is muted by default (`output.micMute = true`).
-
-## Measured (ESP32-WROOM-32, core 3.3.12, 2026-11-23, v1.3.4 → v1.4.0)
-
-| | before | after |
-|---|---|---|
-| `begin()` | 21,958 ms (no pad) / 5,838 ms (pad) | 455–474 ms |
-| worst `loop()` stall, no pad | 5,500,000 µs | 4 µs |
-| free heap, connected | 135,008 | 139,360 |
-| min free heap, connected | 130,204 | 137,956 |
-| `send()` | ~298 µs | ~283 µs (noise level) |
-| flash (testEverything) | 1,057,204 | 1,055,512 |
-| static RAM | 41,108 | 41,236 (+78 B latestPacket copy) |
-
-## Known rough edges
-
-- Input CRC32 is not verified.
-- No `end()` / Bluedroid teardown.
-- MAC spoofing: call `esp_base_mac_addr_set` before `begin()`.
+Input CRC not verified. No `end()`. Bond list: first bonded device is assumed to be the pad.

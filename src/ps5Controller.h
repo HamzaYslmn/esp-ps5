@@ -1,7 +1,9 @@
 /* ps5Controller.h - DualSense (PS5) controller for ESP32 over Bluetooth Classic.
  *
- *   ps5.begin();                                   // non-blocking: scan + connect in background
+ *   ps5.begin();                                   // returns at once; connects in the background
  *   if (ps5.isConnected() && ps5.cross) ps5.lightbar(255,0,0).rumble(0,200).send();
+ *
+ * Never blocks. Input fields are written by the Bluetooth task; frames are sent from it too.
  */
 #ifndef ps5Controller_h
 #define ps5Controller_h
@@ -15,7 +17,7 @@ class ps5Controller {
   /* ============================================================ INPUT (auto-refreshed) */
 
   int8_t  lx = 0, ly = 0, rx = 0, ry = 0;   /* sticks -128..127, 0 = center, push UP = negative */
-  uint8_t deadzone = 8;                     /* % of stick travel that reads 0. Set any value; 0 = raw */
+  uint8_t deadzone = 10;                    /* % of stick travel that reads 0. Set any value; 0 = raw */
   uint8_t l2 = 0, r2 = 0;                   /* analog triggers 0..255 */
 
   int8_t  lxPct() const { return lx * 100 / 127; }   /* -100..100 */
@@ -28,7 +30,7 @@ class ps5Controller {
   /* `if (ps5.square)` = held. `.pressed` / `.released` = edge, latched until read. */
   struct EdgeFlag {
     mutable bool v = false;
-    operator bool() const { bool r = v; v = false; return r; }
+    operator bool() const { return __atomic_exchange_n(&v, false, __ATOMIC_ACQ_REL); }   /* read = consume */
   };
   struct Button {
     bool cur = false;
@@ -63,7 +65,8 @@ class ps5Controller {
     uint8_t ledBrightness = 1;                  /* wire: 0=bright 1=mid 2=dim (use playerLed()) */
     uint8_t muteLed = 0;                        /* 0=off 1=on 2=pulse */
     bool    micMute = true;                     /* mic hardware off by default */
-    uint8_t leftTrigger[11] = {}, rightTrigger[11] = {};   /* [mode, p0..p9], use l2*()/r2*() */
+    bool    releaseLeds = false;                /* true: lightbar + player LEDs run by the pad firmware */
+    uint8_t leftTrigger[11] = {0x05}, rightTrigger[11] = {0x05};   /* [mode, p0..p9]; 0x05 = off */
   } output;
 
   /* ============================================================ API */
@@ -73,12 +76,15 @@ class ps5Controller {
   bool isConnected() const;            /* true while input reports are flowing */
   void forget();                       /* drop the target MAC; next retry rescans */
 
-  /* Chainable output setters. Nothing goes out until send() (max every ~10 ms). */
+  /* Chainable output setters. send() queues one frame; call it as often as you like
+   * (sent from the BT task, at most every 10 ms). LEDs apply once the pad's own
+   * ~3 s connect animation has finished. */
   ps5Controller& lightbar   (uint8_t r, uint8_t g, uint8_t b);
   ps5Controller& rumble     (uint8_t small, uint8_t large);
   ps5Controller& playerLed  (uint8_t index /*1..5*/, uint8_t value /*0 off,1 dim,2 mid,3+ bright*/);
   ps5Controller& muteLed    (uint8_t mode);
   ps5Controller& micMute    (bool on);
+  ps5Controller& releaseLeds(bool on);   /* give LEDs to the pad firmware / take them back */
   ps5Controller& send();
 
   /* Adaptive triggers. Percent args 0..100, freqHz in Hz. One mode per trigger;
@@ -121,9 +127,8 @@ extern ps5Controller ps5;
 
 /* ---- internal glue between the three .cpp files (not for sketches) ---- */
 bool ps5_parse(const uint8_t* p, uint16_t len, bool edges);   /* ps5_bytes.cpp */
-void ps5_send_output(bool resetLeds = false);
-bool ps5_leds_ready();                                        /* pad connect animation done */
-void ps5_send_enable();
+void ps5_send_output(bool ready, bool leds);
+void ps5_send_reset();
 void ps5_send_haptics(const int8_t* samples64);
 void ps5_on_link(bool up);                                    /* ps5Controller.cpp */
 void ps5_on_input(const uint8_t* p, uint16_t len);

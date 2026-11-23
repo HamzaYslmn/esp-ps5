@@ -5,7 +5,10 @@
 //   L1 / R1     -> adaptive trigger mode  TRIANGLE    -> next player-LED pattern
 //   SQUARE      -> player-LED brightness  CIRCLE      -> melody (haptic actuators)
 //   MUTE        -> mute LED off/on/pulse  OPTIONS     -> forget (unpair) controller
+//   CROSS (X)   -> give LEDs to the pad firmware / take them back
 //   TOUCHPAD    -> dump the raw input report
+//
+// loop() never blocks: work is paced with millis(), the library runs on the BT task.
 //
 // First time: hold PS + Create on the controller until the lightbar flashes.
 
@@ -48,6 +51,10 @@ static void buttons() {
   if (ps5.mute.pressed)     ps5.muteLed((ps5.output.muteLed + 1) % 3);
   if (ps5.circle.pressed)   ps5.play(kTune, sizeof(kTune) / sizeof(kTune[0]));
   if (ps5.options.pressed)  ps5.forget();
+  if (ps5.cross.pressed) {
+    ps5.releaseLeds(!ps5.output.releaseLeds);
+    Serial.println(ps5.output.releaseLeds ? "LEDs -> firmware" : "LEDs -> sketch");
+  }
   if (ps5.touchpad.pressed) {
     for (uint8_t b : ps5.latestPacket) Serial.printf("%02x ", b);
     Serial.println();
@@ -74,14 +81,16 @@ static void report() {
 }
 
 void loop() {
-  if (!ps5.isConnected()) { delay(50); return; }
-
+  if (!ps5.isConnected()) return;
   triggers();
   buttons();
-  stickColour(ps5.lx, ps5.ly);
-  ps5.rumble(mag(ps5.rx), mag(ps5.ry)).send();
 
-  static uint32_t t = 0;
-  if (millis() - t > 1000) { t = millis(); report(); }
-  delay(20);   // send() at most every ~10 ms
+  static uint32_t tSend = 0, tReport = 0;
+  uint32_t now = millis();
+  if (now - tSend >= 20) {                   // 50 Hz output is plenty
+    tSend = now;
+    stickColour(ps5.lx, ps5.ly);
+    ps5.rumble(mag(ps5.rx), mag(ps5.ry)).send();
+  }
+  if (now - tReport >= 1000) { tReport = now; report(); }
 }
